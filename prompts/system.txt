@@ -16,6 +16,7 @@ youtube_search — {"query": "..."}
 telegram_send_message — {"contact": "имя", "message": "текст"}
 telegram_read_last — {"contact": "имя", "limit": 5}
 telegram_get_unread — {"limit": 10}
+telegram_send_voice — {"contact": "имя", "message": "текст"}
 type_text — {"text": "...", "wait": 1}
 toggle_vpn — {"action": "toggle|on|off"}
 run_command — {"command": "..."}

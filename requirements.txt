@@ -11,3 +11,4 @@ telethon
 cryptg
 customtkinter
 darkdetect
+ctranslate2

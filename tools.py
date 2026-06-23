@@ -1,5 +1,5 @@
 """
-Инструменты Windy AI Assistant.
+Инструменты Windy AI Assistant — реестр команд для LLM.
 """
 
 from __future__ import annotations
@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import tempfile
 import time
 import webbrowser
 from pathlib import Path
@@ -27,8 +28,16 @@ TOOL_REGISTRY: dict[str, ToolHandler] = {}
 
 def register_tool(name: str, handler: ToolHandler, aliases: list[str] | None = None) -> None:
     TOOL_REGISTRY[name.strip().lower()] = handler
-    for a in aliases or []:
-        TOOL_REGISTRY[a.strip().lower()] = handler
+    for alias in aliases or []:
+        TOOL_REGISTRY[alias.strip().lower()] = handler
+
+
+def _safe_call(fn: ToolHandler, params: dict[str, Any], tool_name: str) -> str:
+    try:
+        return fn(params)
+    except Exception as exc:
+        logger.error("tool %s failed: %s", tool_name, exc, exc_info=True)
+        return f"Ошибка {tool_name}: {exc}"
 
 
 def _type_unicode(text: str, interval: float = 0.04) -> None:
@@ -36,12 +45,15 @@ def _type_unicode(text: str, interval: float = 0.04) -> None:
     if text.isascii():
         pyautogui.write(text, interval=interval)
         return
-    s = text.replace("'", "''")
-    subprocess.run(["powershell", "-NoProfile", "-Command", f"Set-Clipboard -Value '{s}'"], check=True, capture_output=True, timeout=5)
+    safe = text.replace("'", "''")
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command", f"Set-Clipboard -Value '{safe}'"],
+        check=True, capture_output=True, timeout=5,
+    )
     pyautogui.hotkey("ctrl", "v")
 
 
-# --- Telegram ---
+# ── Telegram ──────────────────────────────────────────────────────────────────
 
 def _tool_telegram_send_message(params: dict[str, Any]) -> str:
     msg = str(params.get("message") or params.get("text") or "").strip()
@@ -53,11 +65,12 @@ def _tool_telegram_send_message(params: dict[str, Any]) -> str:
         if tg.is_configured():
             return tg.send_message(contact, msg)
     except Exception as exc:
-        logger.warning("telethon send: %s", exc)
+        logger.warning("telethon send fallback: %s", exc)
     return _tool_telegram_message_ui({"message": msg, "contact": contact})
 
 
 def _tool_telegram_message_ui(params: dict[str, Any]) -> str:
+    """UI-fallback: открыть Telegram Desktop и напечатать."""
     msg = str(params.get("message") or "").strip()
     contact = str(params.get("contact") or "").strip()
     _tool_open_app({"name": "telegram"})
@@ -72,19 +85,21 @@ def _tool_telegram_message_ui(params: dict[str, Any]) -> str:
         time.sleep(0.4)
     _type_unicode(msg, 0.03)
     pyautogui.press("enter")
-    return "Отправлено (UI)"
+    return "Отправлено через UI Telegram"
 
 
 def _tool_telegram_read_last(params: dict[str, Any]) -> str:
     contact = str(params.get("contact") or params.get("to") or "").strip()
-    limit = int(params.get("limit") or 5)
+    count = int(params.get("count") or params.get("limit") or 5)
+    if not contact:
+        return "Укажи контакт (имя, @username или ID)"
     try:
         import telegram_client as tg
         if tg.is_configured():
-            return tg.read_last(contact, limit)
+            return tg.read_last(contact, count)
     except Exception as exc:
         return f"Telegram read: {exc}"
-    return "Настрой Telethon (api_id/hash)"
+    return "Настрой Telethon: telegram_api_id/hash + python telegram_client.py"
 
 
 def _tool_telegram_get_unread(params: dict[str, Any]) -> str:
@@ -95,10 +110,43 @@ def _tool_telegram_get_unread(params: dict[str, Any]) -> str:
             return tg.get_unread(limit)
     except Exception as exc:
         return f"Unread: {exc}"
-    return "Настрой Telethon"
+    return "Настрой Telethon: telegram_api_id/hash + python telegram_client.py"
 
 
-# --- System / media ---
+def _tool_telegram_send_voice(params: dict[str, Any]) -> str:
+    """Синтезирует TTS и отправляет голосовое в Telegram."""
+    contact = str(params.get("contact") or params.get("to") or "").strip()
+    text = str(params.get("message") or params.get("text") or "").strip()
+    if not contact:
+        return "Укажи контакт"
+    if not text:
+        return "Текст голосового пуст"
+
+    try:
+        import telegram_client as tg
+        from voice import synthesize_to_file
+
+        if not tg.is_configured():
+            return "Настрой Telethon для отправки голосовых"
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, dir=config.TEMP_DIR) as f:
+            path = Path(f.name)
+        try:
+            if not synthesize_to_file(text, path):
+                return "Не удалось синтезировать голос"
+            return tg.send_voice(contact, text, path)
+        finally:
+            if path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    except Exception as exc:
+        logger.error("telegram_send_voice: %s", exc)
+        return f"Ошибка голосового: {exc}"
+
+
+# ── Система / медиа ───────────────────────────────────────────────────────────
 
 def _tool_set_brightness(params: dict[str, Any]) -> str:
     level = int(params.get("level") or params.get("percent") or 70)
@@ -113,7 +161,7 @@ def _tool_set_brightness(params: dict[str, Any]) -> str:
         subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True, capture_output=True, timeout=10)
         return f"Яркость {level}%"
     except Exception as exc:
-        return f"Яркость: {exc} (нужен внешний монитор WMI)"
+        return f"Яркость: {exc}"
 
 
 def _tool_volume(params: dict[str, Any]) -> str:
@@ -122,7 +170,7 @@ def _tool_volume(params: dict[str, Any]) -> str:
     steps = int(params.get("steps") or 3)
     if act == "mute":
         pyautogui.press("volumemute")
-        return "Mute"
+        return "Звук выключен"
     key = "volumeup" if act in ("up", "increase") else "volumedown"
     for _ in range(max(1, steps)):
         pyautogui.press(key)
@@ -134,7 +182,10 @@ def _tool_voice_note(params: dict[str, Any]) -> str:
 
 
 def _tool_set_reminder(params: dict[str, Any]) -> str:
-    return reminders.add_reminder(str(params.get("text") or ""), str(params.get("when") or params.get("time") or ""))
+    return reminders.add_reminder(
+        str(params.get("text") or ""),
+        str(params.get("when") or params.get("time") or ""),
+    )
 
 
 def _tool_list_reminders(params: dict[str, Any]) -> str:
@@ -186,7 +237,7 @@ def _tool_open_app(params: dict[str, Any]) -> str:
         p = Path(str(path))
         if not p.exists():
             return f"Не найден: {p}"
-        os.startfile(str(p))  # type: ignore
+        os.startfile(str(p))  # type: ignore[attr-defined]
         return f"Открываю {p.name}"
     if not name:
         return "Приложение не указано"
@@ -198,7 +249,7 @@ def _tool_open_app(params: dict[str, Any]) -> str:
         if " --" in app:
             subprocess.Popen(app, shell=True)
         else:
-            os.startfile(app)  # type: ignore
+            os.startfile(app)  # type: ignore[attr-defined]
         return f"Открываю {name}"
     except Exception as exc:
         return f"Ошибка: {exc}"
@@ -210,8 +261,8 @@ def _tool_launch_game(params: dict[str, Any]) -> str:
     if not app_id:
         return f"Игра не найдена: {game}"
     try:
-        os.startfile(f"steam://run/{app_id}")  # type: ignore
-        return f"Запуск {app_id}"
+        os.startfile(f"steam://run/{app_id}")  # type: ignore[attr-defined]
+        return f"Запуск {game or app_id}"
     except Exception:
         steam = config.APP_PATHS.get("steam")
         if steam:
@@ -251,20 +302,20 @@ def _tool_toggle_vpn(params: dict[str, Any]) -> str:
     bat = str(params.get("path") or config.VPN_TOGGLE_BAT)
     act = str(params.get("action") or "toggle").lower()
     if not bat or not Path(bat).exists():
-        return f"VPN bat не найден"
+        return "VPN bat не найден"
     try:
         if act in ("on", "start"):
             subprocess.Popen(["cmd", "/c", "start", "", bat], cwd=str(Path(bat).parent))
-            return "VPN on"
+            return "VPN включён"
         if act in ("off", "stop"):
             subprocess.run(["taskkill", "/F", "/IM", "winws.exe"], check=False)
-            return "VPN off"
+            return "VPN выключен"
         chk = subprocess.run(["tasklist", "/FI", "IMAGENAME eq winws.exe"], capture_output=True, text=True)
         if "winws.exe" in chk.stdout:
             subprocess.run(["taskkill", "/F", "/IM", "winws.exe"], check=False)
-            return "VPN off"
+            return "VPN выключен"
         subprocess.Popen(["cmd", "/c", "start", "", bat], cwd=str(Path(bat).parent))
-        return "VPN on"
+        return "VPN включён"
     except Exception as exc:
         return str(exc)
 
@@ -303,6 +354,7 @@ def _register() -> None:
     register_tool("telegram_send_message", _tool_telegram_send_message, ["telegram_message", "telegram_send"])
     register_tool("telegram_read_last", _tool_telegram_read_last, ["telegram_read"])
     register_tool("telegram_get_unread", _tool_telegram_get_unread)
+    register_tool("telegram_send_voice", _tool_telegram_send_voice)
     register_tool("type_text", _tool_type_text)
     register_tool("toggle_vpn", _tool_toggle_vpn)
     register_tool("run_command", _tool_run_command)
@@ -329,14 +381,15 @@ class ToolExecutor:
         fn = self.registry.get(tool)
         if not fn:
             return f"Неизвестная команда: {tool}"
-        try:
-            return fn(params or {})
-        except Exception as exc:
-            logger.error("%s: %s", tool, exc)
-            return f"Ошибка {tool}: {exc}"
+        return _safe_call(fn, params or {}, tool)
 
     def execute_all(self, actions: list) -> list[str]:
-        return [self.execute(getattr(a, "tool", None) or a.get("tool", ""), getattr(a, "params", None) or a.get("params", {})) for a in actions]
+        results: list[str] = []
+        for action in actions:
+            tool = getattr(action, "tool", None) or action.get("tool", "")
+            params = getattr(action, "params", None) or action.get("params", {})
+            results.append(self.execute(tool, params))
+        return results
 
     def list_tools(self) -> list[str]:
         return sorted(set(TOOL_REGISTRY))
