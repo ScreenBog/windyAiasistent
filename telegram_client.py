@@ -243,6 +243,30 @@ def get_unread(limit: int = 10) -> str:
         return f"Ошибка непрочитанных: {exc}"
 
 
+async def check_connection_async() -> tuple[bool, str]:
+    """Проверка Telethon: настроен, авторизован, подключён."""
+    if not is_configured():
+        return False, "API ID/Hash не заданы"
+    sess_file = Path(str(config.TELEGRAM_SESSION_PATH) + ".session")
+    if not sess_file.exists():
+        return False, "Нет сессии — python telegram_client.py"
+    try:
+        client = await _client_get()
+        me = await client.get_me()
+        name = me.first_name or me.username or "user"
+        return True, f"@{me.username}" if me.username else name
+    except Exception as exc:
+        logger.debug("tg check: %s", exc)
+        return False, str(exc)[:60]
+
+
+def check_connection() -> tuple[bool, str]:
+    try:
+        return _run(check_connection_async(), timeout=15)
+    except Exception as exc:
+        return False, str(exc)[:60]
+
+
 def auth_cli() -> None:
     if not is_configured():
         print("Заполни telegram_api_id / telegram_api_hash в settings.json")

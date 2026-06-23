@@ -113,6 +113,22 @@ class WindyAssistant:
         reminders.stop_reminder_service()
         self._set_status("остановлен")
 
+    def get_service_health(self) -> dict[str, tuple[bool, str]]:
+        """Статусы сервисов для GUI."""
+        ollama_ok = self.brain.check_connection()
+        whisper_st = self.voice.get_whisper_status()
+        whisper_ok = "ошибка" not in whisper_st.lower()
+        try:
+            import telegram_client as tg
+            tg_ok, tg_msg = tg.check_connection()
+        except Exception as exc:
+            tg_ok, tg_msg = False, str(exc)[:50]
+        return {
+            "ollama": (ollama_ok, "OK" if ollama_ok else "offline"),
+            "whisper": (whisper_ok, whisper_st),
+            "telegram": (tg_ok, tg_msg),
+        }
+
     def reload_settings(self) -> None:
         config.reload_settings()
         self.voice.reload()

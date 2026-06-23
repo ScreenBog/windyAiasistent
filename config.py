@@ -107,6 +107,13 @@ FILE_SEARCH_ROOTS: list[str] = []
 LOG_LEVEL = "INFO"
 PLUGINS_ENABLED = True
 GUI_THEME = "dark"
+GUI_ACCENT = "#3b82f6"
+GUI_ACCENT_HOVER = "#2563eb"
+GUI_ACCENT_HOVER = "#2563eb"
+GUI_SUCCESS = "#22c55e"
+GUI_WARNING = "#f59e0b"
+GUI_DANGER = "#ef4444"
+WHISPER_MODELS = ("tiny", "base", "small", "medium", "large-v3")
 
 WHISPER_BEAM_SIZE = 5
 WHISPER_BEST_OF = 3
@@ -178,7 +185,7 @@ def _apply_dict(data: dict[str, Any]) -> None:
     global POST_TTS_DELAY_SEC, MIC_DEVICE_ID
     global APP_PATHS, STEAM_GAMES, VPN_TOGGLE_BAT, TELEGRAM_API_ID
     global TELEGRAM_API_HASH, TELEGRAM_BOT_TOKEN, TELEGRAM_DEFAULT_CHAT_ID
-    global TELEGRAM_CHATS, FILE_SEARCH_ROOTS, LOG_LEVEL, PLUGINS_ENABLED, GUI_THEME
+    global TELEGRAM_CHATS, FILE_SEARCH_ROOTS, LOG_LEVEL, PLUGINS_ENABLED, GUI_THEME, GUI_ACCENT
 
     WAKE_WORD = str(data.get("wake_word", WAKE_WORD))
     WAKE_WORD_ALIASES = tuple(str(a).lower() for a in data.get("wake_word_aliases", WAKE_WORD_ALIASES))
@@ -238,6 +245,7 @@ def _apply_dict(data: dict[str, Any]) -> None:
     LOG_LEVEL = str(data.get("log_level", LOG_LEVEL))
     PLUGINS_ENABLED = bool(data.get("plugins_enabled", PLUGINS_ENABLED))
     GUI_THEME = str(data.get("gui_theme", GUI_THEME))
+    GUI_ACCENT = str(data.get("gui_accent", GUI_ACCENT))
 
 
 def to_dict() -> dict[str, Any]:
@@ -284,6 +292,7 @@ def to_dict() -> dict[str, Any]:
         "log_level": LOG_LEVEL,
         "plugins_enabled": PLUGINS_ENABLED,
         "gui_theme": GUI_THEME,
+        "gui_accent": GUI_ACCENT,
     }
 
 

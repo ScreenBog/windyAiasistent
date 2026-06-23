@@ -185,13 +185,35 @@ def _sd_kwargs() -> dict:
     return kw
 
 
-def _record_fixed(sec: float) -> np.ndarray:
+def _record_fixed(sec: float, *, emit_levels: bool = False) -> np.ndarray:
+    """Фиксированная запись; при emit_levels — live-уровень для GUI."""
     n = int(sec * config.SAMPLE_RATE)
     if n <= 0:
         return np.array([], dtype=np.float32)
-    audio = sd.rec(n, **{k: v for k, v in _sd_kwargs().items() if k != "dtype"}, dtype=config.DTYPE)
-    sd.wait()
-    return audio.flatten().astype(np.float32)
+
+    if not emit_levels:
+        audio = sd.rec(
+            n, **{k: v for k, v in _sd_kwargs().items() if k != "dtype"}, dtype=config.DTYPE
+        )
+        sd.wait()
+        return audio.flatten().astype(np.float32)
+
+    chunk_n = int(config.SAMPLE_RATE * 0.12)
+    chunks: list[np.ndarray] = []
+    remaining = n
+    try:
+        with sd.InputStream(blocksize=chunk_n, **_sd_kwargs()) as stream:
+            while remaining > 0:
+                take = min(chunk_n, remaining)
+                data, _ = stream.read(take)
+                flat = np.asarray(data, dtype=np.float32).flatten()
+                chunks.append(flat)
+                _emit_mic(_voice_level(flat))
+                remaining -= take
+    except Exception as exc:
+        logger.error("stream record failed: %s", exc)
+        return np.array([], dtype=np.float32)
+    return np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
 
 
 # ── Continuous VAD ────────────────────────────────────────────────────────────
@@ -322,10 +344,30 @@ class ContinuousVAD:
 
         return False
 
+    def _trim_trailing_silence(self, audio: np.ndarray) -> np.ndarray:
+        """Убираем хвостовую тишину, оставляя hangover-паузу внутри фразы."""
+        if audio.size < self.chunk_n * 2:
+            return audio
+        tail_allow = max(1, int(0.35 / self.dt))  # ~350 мс тишины в конце
+        levels = []
+        for i in range(0, len(audio) - self.chunk_n, self.chunk_n):
+            levels.append(_voice_level(audio[i : i + self.chunk_n]))
+        cut_chunks = 0
+        for lvl in reversed(levels):
+            if lvl < self.thr_off:
+                cut_chunks += 1
+            else:
+                break
+        cut_chunks = max(0, cut_chunks - tail_allow)
+        if cut_chunks <= 0:
+            return audio
+        cut_samples = cut_chunks * self.chunk_n
+        return audio[: max(self.chunk_n, len(audio) - cut_samples)]
+
     def get_audio(self) -> np.ndarray:
         if not self.recorded:
             return np.array([], dtype=np.float32)
-        audio = np.concatenate(self.recorded)
+        audio = self._trim_trailing_silence(np.concatenate(self.recorded))
         return _normalize(_highpass(audio))
 
 
@@ -411,7 +453,7 @@ def _has_wake(text: str) -> bool:
 
 
 def listen_chunk(sec: float | None = None) -> str:
-    return transcribe(_record_fixed(sec or config.WAKE_CHUNK_SEC))
+    return transcribe(_record_fixed(sec or config.WAKE_CHUNK_SEC, emit_levels=True))
 
 
 def listen_command() -> str:
@@ -541,6 +583,13 @@ class VoiceEngine:
 
     def set_vad_callback(self, cb: Callable[[str], None] | None) -> None:
         set_vad_state_callback(cb)
+
+    def get_whisper_status(self) -> str:
+        try:
+            _get_whisper()
+            return f"{config.WHISPER_MODEL} ({config.WHISPER_DEVICE}/int8)"
+        except Exception as exc:
+            return f"ошибка: {exc}"
 
     def reload(self) -> None:
         config.reload_settings()
