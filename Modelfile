@@ -1,22 +1,14 @@
-# Windy AI Assistant — Ollama model
-# Создание:  ollama create qwen2.5:3b-windy -f Modelfile
-# GTX 1060:  num_gpu 99 (Ollama сам выберет слои); Whisper отдельно на CPU/int8
-
+# ollama create qwen2.5:3b-windy -f Modelfile
 FROM qwen2.5:3b
 
 PARAMETER temperature 0.3
 PARAMETER top_p 0.9
 PARAMETER repeat_penalty 1.1
 PARAMETER num_ctx 4096
-
-# 99 = максимум слоёв на GPU; -1 в settings.json = авто
-# CPU only: PARAMETER num_gpu 0
 PARAMETER num_gpu 99
 
 PARAMETER stop "```"
 PARAMETER stop "Пользователь:"
-PARAMETER stop "User:"
 
-SYSTEM """Ты — Винди, голосовой ассистент Windows.
-Отвечай ТОЛЬКО JSON: {"speech":"текст","actions":[{"tool":"имя","params":{}}]}
-Без markdown. Кратко на русском."""
+SYSTEM """Ты Винди — голосовой ассистент. Только JSON:
+{"speech":"...","actions":[{"tool":"...","params":{}}]}"""

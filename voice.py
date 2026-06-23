@@ -1,6 +1,10 @@
 """
-Голосовой модуль: STT (faster-whisper), TTS, VAD с hangover.
-Whisper: small + int8, fallback cuda→cpu (без float16 на GTX 10xx).
+Голосовой модуль Windy AI Assistant.
+
+- STT: faster-whisper (small/base, cuda/cpu, int8)
+- TTS: edge-tts + SAPI fallback
+- Wake-word: «Эй Винди», «Hey Винди», «Винди»
+- VAD: RMS + hangover + pre-roll buffer
 """
 
 from __future__ import annotations
@@ -13,71 +17,58 @@ import tempfile
 import time
 from collections import deque
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd
 from scipy.signal import butter, filtfilt
 
-import bootstrap  # noqa: F401 — гарантия sys.path
+import bootstrap  # noqa: F401
 import config
 
 logger = logging.getLogger(__name__)
 
 _whisper_model = None
-_whisper_config_key: tuple[str, str, str] | None = None
+_whisper_key: tuple | None = None
+_on_wake_callback: Callable[[], None] | None = None
 
-_FILLER_PATTERN = re.compile(
-    r"\b(э+|мм+|ну+|ага|угу|типа|как бы|в общем)\b",
-    re.IGNORECASE,
-)
+_FILLER = re.compile(r"\b(э+|мм+|ну+|ага|угу|типа|как бы)\b", re.IGNORECASE)
+
+
+def set_wake_callback(cb: Callable[[], None] | None) -> None:
+    """GUI может подписаться на событие wake-word."""
+    global _on_wake_callback
+    _on_wake_callback = cb
 
 
 def reset_whisper_model() -> None:
-    global _whisper_model, _whisper_config_key
+    global _whisper_model, _whisper_key
     _whisper_model = None
-    _whisper_config_key = None
+    _whisper_key = None
 
 
-def _load_whisper_with_fallback() -> tuple[object, str, str]:
-    """
-    Загружает WhisperModel с цепочкой fallback.
-    Возвращает (model, device, compute_type).
-    """
+def _load_whisper():
     from faster_whisper import WhisperModel
 
-    chain = config.resolve_whisper_backend()
-    last_error: Exception | None = None
-
-    for device, compute in chain:
+    last_err: Exception | None = None
+    for device, compute in config.resolve_whisper_backend():
         try:
-            logger.info(
-                "Пробую Whisper: model=%s device=%s compute=%s",
-                config.WHISPER_MODEL, device, compute,
-            )
-            model = WhisperModel(
-                config.WHISPER_MODEL,
-                device=device,
-                compute_type=compute,
-            )
-            logger.info("Whisper загружен: %s / %s", device, compute)
-            return model, device, compute
+            logger.info("Whisper: model=%s device=%s compute=%s", config.WHISPER_MODEL, device, compute)
+            return WhisperModel(config.WHISPER_MODEL, device=device, compute_type=compute), device, compute
         except Exception as exc:
-            last_error = exc
-            logger.warning("Whisper %s/%s не запустился: %s", device, compute, exc)
-
-    raise RuntimeError(f"Не удалось загрузить Whisper: {last_error}")
+            last_err = exc
+            logger.warning("Whisper fail %s/%s: %s", device, compute, exc)
+    raise RuntimeError(f"Whisper не загружен: {last_err}")
 
 
 def _get_whisper():
-    global _whisper_model, _whisper_config_key
+    global _whisper_model, _whisper_key
     key = (config.WHISPER_MODEL, config.WHISPER_DEVICE, config.WHISPER_COMPUTE_TYPE)
-    if _whisper_model is not None and _whisper_config_key == key:
+    if _whisper_model and _whisper_key == key:
         return _whisper_model
-
-    model, device, compute = _load_whisper_with_fallback()
+    model, dev, comp = _load_whisper()
     _whisper_model = model
-    _whisper_config_key = (config.WHISPER_MODEL, device, compute)
+    _whisper_key = (config.WHISPER_MODEL, dev, comp)
     return _whisper_model
 
 
@@ -87,245 +78,206 @@ def _rms(audio: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
 
 
-def _smooth_level(level: float, history: deque[float]) -> float:
-    history.append(level)
-    return float(np.mean(history))
+def _smooth(level: float, buf: deque[float]) -> float:
+    buf.append(level)
+    return float(np.mean(buf))
 
 
-def _highpass_filter(audio: np.ndarray, sample_rate: int = config.SAMPLE_RATE) -> np.ndarray:
+def _highpass(audio: np.ndarray) -> np.ndarray:
     try:
         if audio.size < 64:
             return audio
-        nyq = sample_rate / 2
-        b, a = butter(2, max(80.0 / nyq, 0.001), btype="high")
+        nyq = config.SAMPLE_RATE / 2
+        b, a = butter(2, max(80 / nyq, 0.001), btype="high")
         return filtfilt(b, a, audio).astype(np.float32)
-    except Exception as exc:
-        logger.debug("highpass: %s", exc)
+    except Exception:
         return audio
 
 
-def _normalize_audio(audio: np.ndarray, target_rms: float = 0.05) -> np.ndarray:
-    rms = _rms(audio)
-    if rms < 1e-6:
+def _normalize(audio: np.ndarray, target: float = 0.05) -> np.ndarray:
+    r = _rms(audio)
+    if r < 1e-6:
         return audio
-    gain = min(target_rms / rms, 10.0)
-    return np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
+    return np.clip(audio * min(target / r, 10.0), -1.0, 1.0).astype(np.float32)
 
 
-def _clean_transcript(text: str) -> str:
+def _clean_text(text: str) -> str:
     if not text:
         return ""
-    text = _FILLER_PATTERN.sub(" ", text)
+    text = _FILLER.sub(" ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    words = text.split()
-    deduped: list[str] = []
-    for w in words:
-        if not deduped or w.lower() != deduped[-1].lower():
-            deduped.append(w)
-    return " ".join(deduped)
+    words: list[str] = []
+    for w in text.split():
+        if not words or words[-1].lower() != w.lower():
+            words.append(w)
+    return " ".join(words)
 
 
-def _record_seconds(duration: float) -> np.ndarray:
-    frames = int(duration * config.SAMPLE_RATE)
-    if frames <= 0:
+def _record_seconds(sec: float) -> np.ndarray:
+    n = int(sec * config.SAMPLE_RATE)
+    if n <= 0:
         return np.array([], dtype=np.float32)
-    try:
-        recording = sd.rec(
-            frames,
-            samplerate=config.SAMPLE_RATE,
-            channels=config.CHANNELS,
-            dtype=config.DTYPE,
-        )
-        sd.wait()
-        return recording.flatten().astype(np.float32)
-    except Exception as exc:
-        logger.error("Ошибка записи: %s", exc)
-        raise
+    rec = sd.rec(n, samplerate=config.SAMPLE_RATE, channels=config.CHANNELS, dtype=config.DTYPE)
+    sd.wait()
+    return rec.flatten().astype(np.float32)
 
 
-def _measure_ambient_noise(seconds: float = 0.6) -> float:
-    """Фоновый шум ДО основной записи (не во время TTS-эха)."""
+def _ambient_noise(sec: float = 0.5) -> float:
     try:
-        audio = _record_seconds(seconds)
-        return _rms(audio)
+        return _rms(_record_seconds(sec))
     except Exception:
         return 0.0
 
 
-def record_continuous(
-    max_duration: float | None = None,
-    silence_sec: float | None = None,
-    speech_threshold: float | None = None,
-    silence_threshold: float | None = None,
-) -> np.ndarray:
+def record_continuous() -> np.ndarray:
     """
-    Непрерывная запись с VAD:
-    - сглаженный RMS (меньше ложных срабатываний);
-    - hangover — паузы внутри фразы не обрезают;
-    - адаптивные пороги от фонового шума;
-    - N подряд тихих чанков для завершения.
+    Непрерывная запись после wake-word.
+
+    Алгоритм:
+    1. Pre-roll buffer — сохраняет начало фразы.
+    2. Сглаженный RMS — меньше ложных срабатываний.
+    3. Hangover — короткие паузы в речи не обрезают запись.
+    4. N тихих чанков подряд → конец записи.
     """
-    max_duration = max_duration or config.VAD_MAX_RECORD_SEC
-    silence_sec = silence_sec or config.VAD_SILENCE_SEC
-    speech_threshold = speech_threshold or config.VAD_SPEECH_THRESHOLD
-    silence_threshold = silence_threshold or config.VAD_SILENCE_THRESHOLD
-    hangover = config.VAD_HANGOVER_SEC
-    min_speech = config.VAD_MIN_SPEECH_SEC
-    wait_speech = config.VAD_WAIT_SPEECH_SEC
+    chunk_n = int(config.SAMPLE_RATE * config.VAD_CHUNK_MS / 1000)
+    chunk_dt = config.VAD_CHUNK_MS / 1000.0
+    pre_max = max(1, int(config.VAD_PRE_ROLL_SEC / chunk_dt))
+    silent_need = max(4, int(config.VAD_SILENCE_SEC / chunk_dt))
+    hang_extra = max(2, int(config.VAD_HANGOVER_SEC / chunk_dt))
 
-    chunk_samples = int(config.SAMPLE_RATE * config.VAD_CHUNK_MS / 1000)
-    pre_roll_chunks = max(1, int(config.VAD_PRE_ROLL_SEC / (config.VAD_CHUNK_MS / 1000)))
-    chunk_duration = config.VAD_CHUNK_MS / 1000.0
-    silent_chunks_needed = max(3, int(silence_sec / chunk_duration))
-    hangover_chunks = max(2, int(hangover / chunk_duration))
-
-    # Калибровка шума отдельно (после post_tts_delay)
-    noise_floor = _measure_ambient_noise(0.5)
-    adaptive_speech = max(speech_threshold, noise_floor * 3.0)
-    adaptive_silence = max(silence_threshold, noise_floor * 1.8)
-    logger.debug(
-        "VAD: noise=%.4f speech_thr=%.4f silence_thr=%.4f",
-        noise_floor, adaptive_speech, adaptive_silence,
-    )
+    noise = _ambient_noise(0.4)
+    thr_speech = max(config.VAD_SPEECH_THRESHOLD, noise * 3.0)
+    thr_silence = max(config.VAD_SILENCE_THRESHOLD, noise * 1.8)
+    logger.debug("VAD noise=%.4f speech=%.4f silence=%.4f", noise, thr_speech, thr_silence)
 
     recorded: list[np.ndarray] = []
-    pre_buffer: deque[np.ndarray] = deque(maxlen=pre_roll_chunks)
-    rms_history: deque[float] = deque(maxlen=config.VAD_RMS_SMOOTH_WINDOW)
+    pre: deque[np.ndarray] = deque(maxlen=pre_max)
+    rms_buf: deque[float] = deque(maxlen=config.VAD_RMS_SMOOTH_WINDOW)
 
-    speech_started = False
-    speech_time = 0.0
-    total_time = 0.0
-    wait_time = 0.0
-    consecutive_silent = 0
-    last_speech_time = 0.0
+    started = False
+    speech_t = wait_t = total_t = 0.0
+    silent_run = 0
+    last_voice_t = 0.0
 
-    try:
-        with sd.InputStream(
-            samplerate=config.SAMPLE_RATE,
-            channels=config.CHANNELS,
-            dtype=config.DTYPE,
-            blocksize=chunk_samples,
-        ) as stream:
-            while total_time < max_duration:
-                chunk, overflowed = stream.read(chunk_samples)
-                if overflowed:
-                    logger.warning("Переполнение буфера")
+    with sd.InputStream(
+        samplerate=config.SAMPLE_RATE,
+        channels=config.CHANNELS,
+        dtype=config.DTYPE,
+        blocksize=chunk_n,
+    ) as stream:
+        while total_t < config.VAD_MAX_RECORD_SEC:
+            chunk, ov = stream.read(chunk_n)
+            if ov:
+                logger.warning("audio overflow")
+            data = np.asarray(chunk, dtype=np.float32).flatten()
+            lvl = _smooth(_rms(data), rms_buf)
+            total_t += chunk_dt
 
-                chunk = np.asarray(chunk, dtype=np.float32).flatten()
-                level = _smooth_level(_rms(chunk), rms_history)
-                total_time += chunk_duration
-
-                if not speech_started:
-                    wait_time += chunk_duration
-                    pre_buffer.append(chunk)
-                    if level >= adaptive_speech:
-                        speech_started = True
-                        recorded.extend(pre_buffer)
-                        pre_buffer.clear()
-                        speech_time = 0.0
-                        consecutive_silent = 0
-                        last_speech_time = total_time
-                        logger.debug("VAD: речь началась (%.4f)", level)
-                    elif wait_time >= wait_speech:
-                        logger.debug("VAD: таймаут ожидания речи")
-                        break
-                    continue
-
-                recorded.append(chunk)
-                speech_time += chunk_duration
-
-                if level < adaptive_silence:
-                    consecutive_silent += 1
-                else:
-                    consecutive_silent = 0
-                    last_speech_time = total_time
-
-                # Hangover: недавняя речь → нужно больше тишины
-                required_silent = silent_chunks_needed
-                if (total_time - last_speech_time) < hangover:
-                    required_silent += hangover_chunks
-
-                if (
-                    consecutive_silent >= required_silent
-                    and speech_time >= min_speech
-                ):
-                    logger.debug(
-                        "VAD: конец (речь %.1fс, тихих чанков %d)",
-                        speech_time, consecutive_silent,
-                    )
+            if not started:
+                wait_t += chunk_dt
+                pre.append(data)
+                if lvl >= thr_speech:
+                    started = True
+                    recorded.extend(pre)
+                    pre.clear()
+                    speech_t = silent_run = 0.0
+                    last_voice_t = total_t
+                    logger.debug("VAD: speech start")
+                elif wait_t >= config.VAD_WAIT_SPEECH_SEC:
+                    logger.debug("VAD: wait timeout")
                     break
+                continue
 
-    except Exception as exc:
-        logger.error("continuous recording: %s", exc)
-        raise
+            recorded.append(data)
+            speech_t += chunk_dt
+
+            if lvl < thr_silence:
+                silent_run += 1
+            else:
+                silent_run = 0
+                last_voice_t = total_t
+
+            need = silent_need
+            if (total_t - last_voice_t) < config.VAD_HANGOVER_SEC:
+                need += hang_extra
+
+            if silent_run >= need and speech_t >= config.VAD_MIN_SPEECH_SEC:
+                logger.debug("VAD: end speech=%.1fs silent_chunks=%d", speech_t, silent_run)
+                break
 
     if not recorded:
         return np.array([], dtype=np.float32)
-
-    audio = np.concatenate(recorded)
-    return _normalize_audio(_highpass_filter(audio))
+    return _normalize(_highpass(np.concatenate(recorded)))
 
 
-def transcribe(audio: np.ndarray, language: str | None = None) -> str:
-    if audio is None or audio.size < config.SAMPLE_RATE * 0.25:
+def transcribe(audio: np.ndarray) -> str:
+    if audio is None or audio.size < config.SAMPLE_RATE * 0.2:
         return ""
-
-    audio = _normalize_audio(_highpass_filter(audio))
-    if _rms(audio) < config.VAD_SILENCE_THRESHOLD * 0.3:
+    audio = _normalize(_highpass(audio))
+    if _rms(audio) < config.VAD_SILENCE_THRESHOLD * 0.25:
         return ""
-
-    lang = language or config.WHISPER_LANGUAGE
-
     try:
         model = _get_whisper()
-        segments, info = model.transcribe(
+        segs, info = model.transcribe(
             audio,
-            language=lang,
+            language=config.WHISPER_LANGUAGE,
             beam_size=config.WHISPER_BEAM_SIZE,
             best_of=config.WHISPER_BEST_OF,
             vad_filter=True,
-            vad_parameters={
-                "min_silence_duration_ms": 400,
-                "speech_pad_ms": 300,
-                "threshold": 0.45,
-            },
+            vad_parameters={"min_silence_duration_ms": 400, "speech_pad_ms": 350},
             no_speech_threshold=config.WHISPER_NO_SPEECH_THRESHOLD,
             compression_ratio_threshold=config.WHISPER_COMPRESSION_RATIO_THRESHOLD,
             log_prob_threshold=config.WHISPER_LOG_PROB_THRESHOLD,
             condition_on_previous_text=False,
             temperature=0.0,
         )
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-        text = _clean_transcript(text)
-        logger.info("STT [%.1fс]: %r", getattr(info, "duration", 0) or 0, text)
+        text = _clean_text(" ".join(s.text.strip() for s in segs))
+        logger.info("STT [%.1fs]: %r", getattr(info, "duration", 0) or 0, text)
         return text
     except Exception as exc:
         logger.error("STT: %s", exc)
-        # Попытка перезагрузки модели при сбое CUDA
         reset_whisper_model()
         return ""
 
 
-def listen_chunk(duration: float | None = None) -> str:
-    duration = duration or config.WAKE_CHUNK_SEC
-    return transcribe(_record_seconds(duration))
-
-
-def listen_command() -> str:
-    """Пауза после TTS → калибровка шума → VAD-запись → STT."""
-    time.sleep(config.POST_TTS_DELAY_SEC)
-    audio = record_continuous()
-    return transcribe(audio)
+def _normalize_wake(text: str) -> str:
+    t = text.lower().strip()
+    t = re.sub(r"[^\w\sа-яё]", " ", t, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def _contains_wake_word(text: str) -> bool:
-    normalized = text.lower().strip()
-    return bool(normalized) and any(a in normalized for a in config.WAKE_WORD_ALIASES)
+    norm = _normalize_wake(text)
+    if not norm:
+        return False
+    # Сначала длинные фразы (точнее)
+    for alias in sorted(config.WAKE_WORD_ALIASES, key=len, reverse=True):
+        if alias in norm:
+            return True
+    return False
+
+
+def listen_chunk(sec: float | None = None) -> str:
+    return transcribe(_record_seconds(sec or config.WAKE_CHUNK_SEC))
+
+
+def listen_command() -> str:
+    time.sleep(config.POST_TTS_DELAY_SEC)
+    return transcribe(record_continuous())
 
 
 def wait_for_wake_word() -> bool:
     try:
-        return _contains_wake_word(listen_chunk(config.WAKE_CHUNK_SEC))
+        text = listen_chunk(config.WAKE_CHUNK_SEC)
+        if _contains_wake_word(text):
+            logger.info("Wake-word: %r", text)
+            if _on_wake_callback:
+                try:
+                    _on_wake_callback()
+                except Exception:
+                    pass
+            return True
+        return False
     except Exception as exc:
         logger.error("wake-word: %s", exc)
         time.sleep(config.WAKE_POLL_INTERVAL)
@@ -334,29 +286,26 @@ def wait_for_wake_word() -> bool:
 
 # --- TTS ---
 
-async def _speak_edge_tts(text: str, output_path: Path) -> bool:
+async def _edge_tts(text: str, path: Path) -> bool:
     try:
         import edge_tts
-
-        comm = edge_tts.Communicate(text, voice=config.TTS_VOICE, rate=config.TTS_RATE, volume=config.TTS_VOLUME)
-        await comm.save(str(output_path))
-        return output_path.exists() and output_path.stat().st_size > 0
+        await edge_tts.Communicate(text, voice=config.TTS_VOICE, rate=config.TTS_RATE, volume=config.TTS_VOLUME).save(str(path))
+        return path.exists() and path.stat().st_size > 0
     except Exception as exc:
         logger.warning("edge-tts: %s", exc)
         return False
 
 
-def _speak_sapi(text: str) -> bool:
+def _sapi(text: str) -> bool:
     if not config.TTS_USE_SAPI_FALLBACK:
         return False
     safe = text.replace("'", "''")
-    script = (
-        "Add-Type -AssemblyName System.Speech; "
-        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-        f"$s.Speak('{safe}')"
-    )
     try:
-        subprocess.run(["powershell", "-NoProfile", "-Command", script], check=True, capture_output=True, timeout=60)
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{safe}')"],
+            check=True, capture_output=True, timeout=90,
+        )
         return True
     except Exception as exc:
         logger.warning("SAPI: %s", exc)
@@ -368,22 +317,22 @@ def speak(text: str) -> None:
         return
     text = text.strip()
     logger.info("TTS: %r", text)
-    tmp_path: Optional[Path] = None
+    tmp: Optional[Path] = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, dir=config.TEMP_DIR) as tmp:
-            tmp_path = Path(tmp.name)
-        if asyncio.run(_speak_edge_tts(text, tmp_path)):
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, dir=config.TEMP_DIR) as f:
+            tmp = Path(f.name)
+        if asyncio.run(_edge_tts(text, tmp)):
             from playsound3 import playsound
-            playsound(str(tmp_path), block=True)
+            playsound(str(tmp), block=True)
             return
-        _speak_sapi(text)
+        _sapi(text)
     except Exception as exc:
         logger.error("TTS: %s", exc)
-        _speak_sapi(text)
+        _sapi(text)
     finally:
-        if tmp_path and tmp_path.exists():
+        if tmp and tmp.exists():
             try:
-                tmp_path.unlink()
+                tmp.unlink()
             except OSError:
                 pass
 
@@ -398,11 +347,8 @@ class VoiceEngine:
     def speak(self, text: str) -> None:
         speak(text)
 
-    def transcribe(self, audio: np.ndarray) -> str:
-        return transcribe(audio)
-
-    def record_continuous(self, **kwargs) -> np.ndarray:
-        return record_continuous(**kwargs)
+    def record_continuous(self) -> np.ndarray:
+        return record_continuous()
 
     def reload(self) -> None:
         config.reload_settings()

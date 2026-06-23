@@ -1,5 +1,5 @@
 """
-GUI Windy AI Assistant (tkinter).
+GUI Windy AI Assistant — tkinter.
 Вкладки: Статус | Настройки | Приложения | Telegram | Логи
 """
 
@@ -16,7 +16,6 @@ bootstrap.ensure_project_path()
 
 import config
 from main import WindyAssistant, add_log_callback, remove_log_callback, setup_logging
-from tools import TelegramBot, _get_bot
 
 setup_logging()
 
@@ -25,295 +24,263 @@ class WindyGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Windy AI Assistant")
-        self.root.geometry("860x680")
-        self.root.minsize(720, 520)
+        self.root.geometry("900x700")
+        self.root.minsize(760, 560)
 
         self.assistant = WindyAssistant()
-        self._log_cb = self._append_log
+        self.assistant.on_status(self._on_status)
+        self._log_fn = self._log
 
-        self._build_ui()
-        add_log_callback(self._log_cb)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._build()
+        add_log_callback(self._log_fn)
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
 
-    def _build_ui(self) -> None:
+    def _build(self) -> None:
         nb = ttk.Notebook(self.root)
         nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        # --- Статус ---
-        tab_status = ttk.Frame(nb)
-        nb.add(tab_status, text="Статус")
+        # ---- Статус ----
+        t0 = ttk.Frame(nb)
+        nb.add(t0, text="Статус")
 
-        self.status_lbl = ttk.Label(tab_status, text="Статус: остановлен", font=("Segoe UI", 11))
-        self.status_lbl.pack(anchor=tk.W, padx=10, pady=8)
+        self.lbl_status = ttk.Label(t0, text="Статус: остановлен", font=("Segoe UI", 12, "bold"))
+        self.lbl_status.pack(anchor=tk.W, padx=12, pady=8)
 
-        btns = ttk.Frame(tab_status)
-        btns.pack(anchor=tk.W, padx=10)
-        self.btn_start = ttk.Button(btns, text="▶ Старт", command=self._start)
+        self.lbl_wake = ttk.Label(t0, text=self._wake_info(), foreground="#2060a0")
+        self.lbl_wake.pack(anchor=tk.W, padx=12)
+
+        bf = ttk.Frame(t0)
+        bf.pack(anchor=tk.W, padx=12, pady=10)
+        self.btn_start = ttk.Button(bf, text="▶ Старт", command=self._start)
         self.btn_start.pack(side=tk.LEFT, padx=3)
-        self.btn_stop = ttk.Button(btns, text="■ Стоп", command=self._stop, state=tk.DISABLED)
+        self.btn_stop = ttk.Button(bf, text="■ Стоп", command=self._stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=3)
-        ttk.Button(btns, text="Ollama", command=self._test_ollama).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btns, text="TTS", command=self._test_tts).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btns, text="Whisper", command=self._test_whisper).pack(side=tk.LEFT, padx=3)
+        for txt, cmd in [
+            ("Ollama", self._test_ollama),
+            ("Whisper", self._test_whisper),
+            ("TTS", self._test_tts),
+        ]:
+            ttk.Button(bf, text=txt, command=cmd).pack(side=tk.LEFT, padx=3)
 
-        mf = ttk.LabelFrame(tab_status, text="Текстовая команда")
-        mf.pack(fill=tk.X, padx=10, pady=8)
-        self.manual_entry = ttk.Entry(mf)
-        self.manual_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=5)
-        self.manual_entry.bind("<Return>", lambda e: self._manual_command())
-        ttk.Button(mf, text="Отправить", command=self._manual_command).pack(side=tk.LEFT, padx=5)
+        mf = ttk.LabelFrame(t0, text="Текстовая команда")
+        mf.pack(fill=tk.X, padx=12, pady=8)
+        self.entry_cmd = ttk.Entry(mf)
+        self.entry_cmd.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6, pady=6)
+        self.entry_cmd.bind("<Return>", lambda e: self._send_text())
+        ttk.Button(mf, text="Отправить", command=self._send_text).pack(side=tk.LEFT, padx=6)
 
-        self.info_lbl = ttk.Label(tab_status, text=self._info_text(), justify=tk.LEFT)
-        self.info_lbl.pack(anchor=tk.W, padx=10, pady=5)
+        self.lbl_info = ttk.Label(t0, text=self._sys_info(), justify=tk.LEFT)
+        self.lbl_info.pack(anchor=tk.W, padx=12, pady=6)
 
-        # --- Настройки ---
-        tab_set = ttk.Frame(nb)
-        nb.add(tab_set, text="Настройки")
-
-        sf = ttk.Frame(tab_set)
-        sf.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
-
+        # ---- Настройки ----
+        t1 = ttk.Frame(nb)
+        nb.add(t1, text="Настройки")
+        sf = ttk.Frame(t1)
+        sf.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
         self.vars: dict[str, tk.Variable] = {}
-        fields: list[tuple[str, str, object]] = [
+        fields = [
             ("wake_word", "Wake-word", config.WAKE_WORD),
-            ("ollama_model", "Ollama модель", config.OLLAMA_MODEL),
-            ("whisper_model", "Whisper модель", config.WHISPER_MODEL),
-            ("whisper_device", "Whisper device (cpu/cuda/auto)", config.WHISPER_DEVICE),
+            ("ollama_model", "Ollama", config.OLLAMA_MODEL),
+            ("whisper_model", "Whisper model", config.WHISPER_MODEL),
+            ("whisper_device", "Whisper device (auto/cpu/cuda)", config.WHISPER_DEVICE),
             ("whisper_compute_type", "Whisper compute (int8)", config.WHISPER_COMPUTE_TYPE),
-            ("tts_voice", "TTS голос", config.TTS_VOICE),
             ("vad_silence_sec", "VAD тишина (сек)", config.VAD_SILENCE_SEC),
-            ("vad_hangover_sec", "VAD hangover (сек)", config.VAD_HANGOVER_SEC),
-            ("post_tts_delay_sec", "Пауза после TTS (сек)", config.POST_TTS_DELAY_SEC),
-            ("ollama_num_ctx", "Ollama num_ctx", config.OLLAMA_NUM_CTX),
-            ("ollama_num_gpu", "Ollama num_gpu (-1=авто)", config.OLLAMA_NUM_GPU),
+            ("vad_hangover_sec", "VAD hangover", config.VAD_HANGOVER_SEC),
+            ("vad_pre_roll_sec", "Pre-roll (сек)", config.VAD_PRE_ROLL_SEC),
+            ("post_tts_delay_sec", "Пауза после TTS", config.POST_TTS_DELAY_SEC),
+            ("ollama_num_ctx", "num_ctx", config.OLLAMA_NUM_CTX),
+            ("ollama_num_gpu", "num_gpu (-1=авто)", config.OLLAMA_NUM_GPU),
         ]
-        for i, (key, label, default) in enumerate(fields):
-            ttk.Label(sf, text=label).grid(row=i, column=0, sticky=tk.W, pady=2)
-            if isinstance(default, float):
-                var: tk.Variable = tk.DoubleVar(value=default)
-            elif isinstance(default, int):
-                var = tk.IntVar(value=default)
-            else:
-                var = tk.StringVar(value=str(default))
-            self.vars[key] = var
-            ttk.Entry(sf, textvariable=var, width=42).grid(row=i, column=1, sticky=tk.EW, pady=2)
+        for i, (k, lbl, val) in enumerate(fields):
+            ttk.Label(sf, text=lbl).grid(row=i, column=0, sticky=tk.W, pady=2)
+            v: tk.Variable
+            v = tk.DoubleVar(value=val) if isinstance(val, float) else (
+                tk.IntVar(value=val) if isinstance(val, int) else tk.StringVar(value=str(val))
+            )
+            self.vars[k] = v
+            ttk.Entry(sf, textvariable=v, width=44).grid(row=i, column=1, sticky=tk.EW, pady=2)
         sf.columnconfigure(1, weight=1)
+        ttk.Button(t1, text="💾 Сохранить", command=self._save).pack(pady=6)
+        ttk.Button(t1, text="🔄 Hot-reload", command=self._reload).pack(pady=2)
 
-        ttk.Button(tab_set, text="💾 Сохранить", command=self._save_settings).pack(pady=6)
-        ttk.Button(tab_set, text="🔄 Hot-reload", command=self._reload).pack(pady=2)
-
-        # --- Приложения ---
-        tab_apps = ttk.Frame(nb)
-        nb.add(tab_apps, text="Приложения")
-        af = ttk.Frame(tab_apps)
-        af.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
-        self.apps_list = tk.Listbox(af, height=10)
-        self.apps_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb = ttk.Scrollbar(af, command=self.apps_list.yview)
+        # ---- Приложения ----
+        t2 = ttk.Frame(nb)
+        nb.add(t2, text="Приложения")
+        af = ttk.Frame(t2)
+        af.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        self.lst_apps = tk.Listbox(af, height=12)
+        self.lst_apps.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(af, command=self.lst_apps.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.apps_list.config(yscrollcommand=sb.set)
+        self.lst_apps.config(yscrollcommand=sb.set)
         self._refresh_apps()
+        ef = ttk.Frame(t2)
+        ef.pack(fill=tk.X, padx=12, pady=4)
+        self.v_app_name = tk.StringVar()
+        self.v_app_path = tk.StringVar()
+        ttk.Entry(ef, textvariable=self.v_app_name, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Entry(ef, textvariable=self.v_app_path, width=50).pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
+        ttk.Button(ef, text="+", command=self._app_add).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ef, text="−", command=self._app_del).pack(side=tk.LEFT)
 
-        ef = ttk.Frame(tab_apps)
-        ef.pack(fill=tk.X, padx=10, pady=4)
-        self.app_name = tk.StringVar()
-        self.app_path = tk.StringVar()
-        ttk.Label(ef, text="Имя:").pack(side=tk.LEFT)
-        ttk.Entry(ef, textvariable=self.app_name, width=10).pack(side=tk.LEFT, padx=3)
-        ttk.Label(ef, text="Путь:").pack(side=tk.LEFT)
-        ttk.Entry(ef, textvariable=self.app_path, width=48).pack(side=tk.LEFT, padx=3, fill=tk.X, expand=True)
-        ttk.Button(ef, text="+", command=self._add_app).pack(side=tk.LEFT, padx=2)
-        ttk.Button(ef, text="−", command=self._del_app).pack(side=tk.LEFT)
-
-        # --- Telegram ---
-        tab_tg = ttk.Frame(nb)
-        nb.add(tab_tg, text="Telegram")
-        tg = ttk.Frame(tab_tg)
-        tg.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
-
-        self.tg_token = tk.StringVar(value=config.TELEGRAM_BOT_TOKEN)
-        self.tg_chat = tk.StringVar(value=config.TELEGRAM_DEFAULT_CHAT_ID)
-        self.tg_contact = tk.StringVar()
-        self.tg_chatid_map = tk.StringVar()
-
-        ttk.Label(tg, text="Bot Token (@BotFather):").grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(tg, textvariable=self.tg_token, width=50, show="*").grid(row=0, column=1, sticky=tk.EW, pady=3)
-        ttk.Label(tg, text="Default chat_id:").grid(row=1, column=0, sticky=tk.W)
-        ttk.Entry(tg, textvariable=self.tg_chat, width=50).grid(row=1, column=1, sticky=tk.EW, pady=3)
-        ttk.Label(tg, text="Контакт → chat_id (JSON):").grid(row=2, column=0, sticky=tk.NW)
-        self.tg_chatid_map.set(json.dumps(config.TELEGRAM_CHATS, ensure_ascii=False, indent=2))
-        ttk.Entry(tg, textvariable=self.tg_chatid_map, width=50).grid(row=2, column=1, sticky=tk.EW, pady=3)
-
-        hint = (
-            "Для read: напиши боту /start, узнай chat_id через getUpdates,\n"
-            "добавь в telegram_chats: {\"маша\": \"123456789\"}"
-        )
-        ttk.Label(tg, text=hint, foreground="gray").grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=6)
-
-        tgf = ttk.Frame(tg)
-        tgf.grid(row=4, column=0, columnspan=2, sticky=tk.W)
-        ttk.Button(tgf, text="Сохранить TG", command=self._save_telegram).pack(side=tk.LEFT, padx=3)
-        ttk.Button(tgf, text="Тест бота", command=self._test_telegram).pack(side=tk.LEFT, padx=3)
-        ttk.Button(tgf, text="Тест read", command=self._test_tg_read).pack(side=tk.LEFT, padx=3)
+        # ---- Telegram ----
+        t3 = ttk.Frame(nb)
+        nb.add(t3, text="Telegram")
+        tg = ttk.Frame(t3)
+        tg.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        self.v_api_id = tk.StringVar(value=str(config.TELEGRAM_API_ID or ""))
+        self.v_api_hash = tk.StringVar(value=config.TELEGRAM_API_HASH)
+        self.v_bot_token = tk.StringVar(value=config.TELEGRAM_BOT_TOKEN)
+        rows = [
+            ("API ID (my.telegram.org):", self.v_api_id, False),
+            ("API Hash:", self.v_api_hash, False),
+            ("Bot Token (опц.):", self.v_bot_token, True),
+        ]
+        for i, (lbl, var, secret) in enumerate(rows):
+            ttk.Label(tg, text=lbl).grid(row=i, column=0, sticky=tk.W, pady=3)
+            ttk.Entry(tg, textvariable=var, width=48, show="*" if secret else "").grid(row=i, column=1, sticky=tk.EW)
+        ttk.Label(
+            tg,
+            text="Telethon: python telegram_client.py  (первый вход — код из Telegram)",
+            foreground="gray",
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=6)
+        tbf = ttk.Frame(tg)
+        tbf.grid(row=4, column=0, columnspan=2, sticky=tk.W)
+        ttk.Button(tbf, text="Сохранить TG", command=self._save_tg).pack(side=tk.LEFT, padx=3)
+        ttk.Button(tbf, text="Тест read_last", command=self._test_tg_read).pack(side=tk.LEFT, padx=3)
         tg.columnconfigure(1, weight=1)
 
-        # --- Логи ---
-        tab_log = ttk.Frame(nb)
-        nb.add(tab_log, text="Логи")
-        self.log_box = scrolledtext.ScrolledText(tab_log, height=28, state=tk.DISABLED, font=("Consolas", 9))
-        self.log_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
-        ttk.Button(tab_log, text="Очистить", command=self._clear_log).pack(pady=4)
+        # ---- Логи ----
+        t4 = ttk.Frame(nb)
+        nb.add(t4, text="Логи")
+        self.txt_log = scrolledtext.ScrolledText(t4, height=30, state=tk.DISABLED, font=("Consolas", 9))
+        self.txt_log.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        ttk.Button(t4, text="Очистить", command=self._clear_log).pack(pady=4)
 
-    def _info_text(self) -> str:
+    def _wake_info(self) -> str:
+        return "Wake-word: «Эй Винди» | «Hey Винди» | «Винди»"
+
+    def _sys_info(self) -> str:
         return (
-            f"Wake-word: {config.WAKE_WORD}\n"
-            f"Ollama: {config.OLLAMA_MODEL}\n"
             f"Whisper: {config.WHISPER_MODEL} ({config.WHISPER_DEVICE}/{config.WHISPER_COMPUTE_TYPE})\n"
-            f"Инструментов: {len(self.assistant.tools.list_tools())}"
+            f"Ollama: {config.OLLAMA_MODEL}\n"
+            f"Tools: {len(self.assistant.tools.list_tools())}"
         )
 
-    def _append_log(self, msg: str) -> None:
+    def _on_status(self, s: str) -> None:
+        try:
+            self.root.after(0, lambda: self.lbl_status.config(text=f"Статус: {s}"))
+        except Exception:
+            pass
+
+    def _log(self, msg: str) -> None:
         def _do():
-            self.log_box.config(state=tk.NORMAL)
-            self.log_box.insert(tk.END, msg + "\n")
-            self.log_box.see(tk.END)
-            self.log_box.config(state=tk.DISABLED)
+            self.txt_log.config(state=tk.NORMAL)
+            self.txt_log.insert(tk.END, msg + "\n")
+            self.txt_log.see(tk.END)
+            self.txt_log.config(state=tk.DISABLED)
         try:
             self.root.after(0, _do)
         except Exception:
             pass
 
     def _clear_log(self) -> None:
-        self.log_box.config(state=tk.NORMAL)
-        self.log_box.delete("1.0", tk.END)
-        self.log_box.config(state=tk.DISABLED)
+        self.txt_log.config(state=tk.NORMAL)
+        self.txt_log.delete("1.0", tk.END)
+        self.txt_log.config(state=tk.DISABLED)
 
     def _refresh_apps(self) -> None:
-        self.apps_list.delete(0, tk.END)
+        self.lst_apps.delete(0, tk.END)
         for n, p in sorted(config.APP_PATHS.items()):
-            self.apps_list.insert(tk.END, f"{n} → {p}")
+            self.lst_apps.insert(tk.END, f"{n} → {p}")
 
-    def _add_app(self) -> None:
-        n, p = self.app_name.get().strip().lower(), self.app_path.get().strip()
-        if not n or not p:
-            messagebox.showwarning("", "Имя и путь обязательны")
-            return
-        config.APP_PATHS[n] = p
-        config.save_settings()
-        self._refresh_apps()
-
-    def _del_app(self) -> None:
-        sel = self.apps_list.curselection()
-        if not sel:
-            return
-        name = self.apps_list.get(sel[0]).split(" → ")[0].strip()
-        config.APP_PATHS.pop(name, None)
-        config.save_settings()
-        self._refresh_apps()
-
-    def _save_settings(self) -> None:
+    def _save(self) -> None:
         data = config.to_dict()
         for k, v in self.vars.items():
             data[k] = v.get()
-        try:
-            config.SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            config.reload_settings()
-            self.info_lbl.config(text=self._info_text())
-            messagebox.showinfo("", "Сохранено")
-        except Exception as exc:
-            messagebox.showerror("", str(exc))
+        config.SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        config.reload_settings()
+        self.lbl_info.config(text=self._sys_info())
+        messagebox.showinfo("", "Сохранено")
 
-    def _save_telegram(self) -> None:
+    def _save_tg(self) -> None:
         data = config.to_dict()
-        data["telegram_bot_token"] = self.tg_token.get().strip()
-        data["telegram_default_chat_id"] = self.tg_chat.get().strip()
         try:
-            chats = json.loads(self.tg_chatid_map.get() or "{}")
-            data["telegram_chats"] = {str(k).lower(): str(v) for k, v in chats.items()}
-        except json.JSONDecodeError as exc:
-            messagebox.showerror("", f"Невалидный JSON telegram_chats: {exc}")
+            data["telegram_api_id"] = int(self.v_api_id.get() or 0)
+        except ValueError:
+            messagebox.showerror("", "API ID — число")
             return
-        try:
-            config.SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            config.reload_settings()
-            messagebox.showinfo("", "Telegram настройки сохранены")
-        except Exception as exc:
-            messagebox.showerror("", str(exc))
+        data["telegram_api_hash"] = self.v_api_hash.get().strip()
+        data["telegram_bot_token"] = self.v_bot_token.get().strip()
+        config.SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        config.reload_settings()
+        messagebox.showinfo("", "Telegram сохранён")
 
     def _reload(self) -> None:
-        config.reload_settings()
         self.assistant.reload_settings()
-        self.info_lbl.config(text=self._info_text())
+        self.lbl_info.config(text=self._sys_info())
         messagebox.showinfo("", "Hot-reload OK")
+
+    def _app_add(self) -> None:
+        n, p = self.v_app_name.get().strip().lower(), self.v_app_path.get().strip()
+        if n and p:
+            config.APP_PATHS[n] = p
+            config.save_settings()
+            self._refresh_apps()
+
+    def _app_del(self) -> None:
+        sel = self.lst_apps.curselection()
+        if sel:
+            name = self.lst_apps.get(sel[0]).split(" → ")[0]
+            config.APP_PATHS.pop(name, None)
+            config.save_settings()
+            self._refresh_apps()
 
     def _start(self) -> None:
         if self.assistant.is_running:
             return
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
-        self.status_lbl.config(text="Статус: слушаю...")
         self.assistant.run_in_thread()
-        self.root.after(500, self._poll)
+        self.root.after(600, self._poll)
 
     def _poll(self) -> None:
         if self.assistant.is_running:
-            self.root.after(500, self._poll)
+            self.root.after(600, self._poll)
         else:
-            self._on_stopped()
+            self.btn_start.config(state=tk.NORMAL)
+            self.btn_stop.config(state=tk.DISABLED)
 
     def _stop(self) -> None:
         self.assistant.stop()
-        self._on_stopped()
-
-    def _on_stopped(self) -> None:
-        self.btn_start.config(state=tk.NORMAL)
-        self.btn_stop.config(state=tk.DISABLED)
-        self.status_lbl.config(text="Статус: остановлен")
 
     def _test_ollama(self) -> None:
-        ok = self.assistant.brain.check_connection()
-        messagebox.showinfo("Ollama", "OK" if ok else "Недоступна")
+        messagebox.showinfo("Ollama", "OK" if self.assistant.brain.check_connection() else "Недоступна")
+
+    def _test_whisper(self) -> None:
+        def _w():
+            try:
+                from voice import _get_whisper
+                _get_whisper()
+                self.root.after(0, lambda: messagebox.showinfo("Whisper", "OK"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Whisper", str(e)))
+        threading.Thread(target=_w, daemon=True).start()
 
     def _test_tts(self) -> None:
         threading.Thread(target=lambda: self.assistant.voice.speak("Тест Винди"), daemon=True).start()
 
-    def _test_whisper(self) -> None:
-        def _run():
-            try:
-                from voice import _get_whisper
-                _get_whisper()
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Whisper",
-                    f"OK: {config.WHISPER_DEVICE}/{config.WHISPER_COMPUTE_TYPE}",
-                ))
-            except Exception as exc:
-                self.root.after(0, lambda: messagebox.showerror("Whisper", str(exc)))
-        threading.Thread(target=_run, daemon=True).start()
-
-    def _test_telegram(self) -> None:
-        self._save_telegram()
-        bot = _get_bot()
-        if not bot:
-            messagebox.showerror("", "Укажи bot token")
-            return
-        try:
-            msg = bot.test_connection()
-            messagebox.showinfo("", msg)
-        except Exception as exc:
-            messagebox.showerror("", str(exc))
-
     def _test_tg_read(self) -> None:
-        self._save_telegram()
-        result = self.assistant.tools.execute("telegram_read", {"limit": 3})
-        messagebox.showinfo("telegram_read", result)
+        r = self.assistant.tools.execute("telegram_read_last", {"limit": 3})
+        messagebox.showinfo("read_last", r)
 
-    def _manual_command(self) -> None:
-        text = self.manual_entry.get().strip()
-        if text:
-            threading.Thread(target=lambda: self.assistant.process_command(text), daemon=True).start()
+    def _send_text(self) -> None:
+        t = self.entry_cmd.get().strip()
+        if t:
+            threading.Thread(target=lambda: self.assistant.process_command(t), daemon=True).start()
 
-    def _on_close(self) -> None:
-        remove_log_callback(self._log_cb)
+    def _close(self) -> None:
+        remove_log_callback(self._log_fn)
         self.assistant.stop()
         self.root.destroy()
 

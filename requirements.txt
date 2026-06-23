@@ -1,9 +1,11 @@
 faster-whisper
 sounddevice
 scipy
+numpy
 edge-tts
 playsound3
 requests
 ollama
 pyautogui
-numpy
+telethon
+cryptg
