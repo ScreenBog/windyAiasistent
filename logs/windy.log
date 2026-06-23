@@ -1,0 +1,123 @@
+23:57:12 [INFO] tools: Инструмент зарегистрирован: get_time
+23:57:12 [INFO] tools: Инструмент зарегистрирован: get_date
+23:57:12 [INFO] plugin_manager: Плагин загружен: example_plugin.py
+23:57:12 [INFO] windy: Плагины: example_plugin.py
+23:57:42 [INFO] windy: Команда: открой телеграмм
+23:57:46 [INFO] windy: Команда: открой телеграмм
+23:57:47 [INFO] windy: Запуск Windy | wake=винди | model=qwen2.5:3b-windy
+23:57:47 [INFO] httpx: HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+23:57:47 [INFO] voice: TTS: 'Винди на связи. Скажи «Винди», когда понадоблюсь.'
+23:57:49 [INFO] windy: Команда: открой телеграмм
+23:57:54 [INFO] httpx: HTTP Request: POST http://127.0.0.1:11434/api/chat "HTTP/1.1 200 OK"
+23:57:54 [INFO] tools: open_app → Открываю telegram
+23:57:54 [INFO] voice: TTS: 'Открываю Telegram.'
+23:57:55 [INFO] httpx: HTTP Request: POST http://127.0.0.1:11434/api/chat "HTTP/1.1 200 OK"
+23:57:55 [INFO] tools: open_app → Открываю telegram
+23:57:55 [INFO] voice: TTS: 'Открываю Telegram.'
+23:57:56 [INFO] httpx: HTTP Request: POST http://127.0.0.1:11434/api/chat "HTTP/1.1 200 OK"
+23:57:56 [INFO] tools: open_app → Открываю telegram
+23:57:56 [INFO] voice: TTS: 'Открываю Telegram.'
+23:58:00 [INFO] windy: Tools result: ['Открываю telegram']
+23:58:00 [INFO] windy: Tools result: ['Открываю telegram']
+23:58:00 [INFO] windy: Tools result: ['Открываю telegram']
+23:58:01 [INFO] windy: Ожидание «винди»... (Ctrl+C / Stop)
+23:58:05 [INFO] httpx: HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+23:58:06 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:07 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:08 [INFO] voice: TTS: 'Тест голоса Винди'
+23:58:10 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:12 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:12 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:13 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:16 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:16 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:17 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:19 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:20 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:20 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:23 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:23 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:24 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:26 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:27 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:27 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:30 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:30 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:31 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:34 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:34 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:34 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:37 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:37 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:38 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:41 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:41 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:41 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:43 [INFO] windy: Команда: открой телеграмм и напиши контакту сытин привет
+23:58:44 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:44 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:45 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:45 [INFO] httpx: HTTP Request: POST http://127.0.0.1:11434/api/chat "HTTP/1.1 200 OK"
+23:58:48 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:48 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:48 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:50 [INFO] tools: telegram_send → Сообщение отправлено
+23:58:50 [INFO] voice: TTS: 'Отправляю сообщение Сытину.'
+23:58:51 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:51 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:52 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:55 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:55 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:55 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:58:57 [INFO] windy: Tools result: ['Сообщение отправлено']
+23:58:58 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:58:58 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:58:59 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:02 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:02 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:02 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:05 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:05 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:06 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:09 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:09 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:09 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:12 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:12 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:13 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:16 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:16 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:17 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:19 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:19 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:20 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:23 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:23 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:24 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:26 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:26 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:27 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:30 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:30 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:31 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:33 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:33 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:34 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:37 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:37 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:38 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:40 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:40 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:41 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:44 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:44 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:45 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:47 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:47 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:48 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:51 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:51 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:52 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.
+23:59:54 [INFO] voice: Загрузка Whisper: model=small device=cuda compute=float16
+23:59:54 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-small/revision/main "HTTP/1.1 200 OK"
+23:59:55 [ERROR] voice: Ошибка STT: Requested float16 compute type, but the target device or backend do not support efficient float16 computation.

@@ -1,0 +1,1 @@
+# Пакет плагинов Windy AI Assistant
