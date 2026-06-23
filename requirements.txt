@@ -9,3 +9,5 @@ ollama
 pyautogui
 telethon
 cryptg
+customtkinter
+darkdetect

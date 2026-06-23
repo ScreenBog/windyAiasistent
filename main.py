@@ -1,7 +1,5 @@
 """
 Windy AI Assistant — entry point.
-  python main.py         CLI
-  python main.py --gui   GUI
 """
 
 from __future__ import annotations
@@ -18,19 +16,21 @@ from bootstrap import PROJECT_DIR
 bootstrap.ensure_project_path()
 
 import config
+import history
+import reminders
 from brain import Brain
 from plugin_manager import load_plugins
 from tools import ToolExecutor
 from voice import VoiceEngine, set_wake_callback
 
-_log_cbs: list[Callable[[str], None]] = []
+_log: list[Callable[[str], None]] = []
 
 
 class GuiLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
-            for cb in list(_log_cbs):
+            for cb in list(_log):
                 try:
                     cb(msg)
                 except Exception:
@@ -40,10 +40,9 @@ class GuiLogHandler(logging.Handler):
 
 
 def setup_logging(level: str | None = None) -> None:
-    lvl = getattr(logging, (level or config.LOG_LEVEL).upper(), logging.INFO)
     root = logging.getLogger()
     root.handlers.clear()
-    root.setLevel(lvl)
+    root.setLevel(getattr(logging, (level or config.LOG_LEVEL).upper(), logging.INFO))
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%H:%M:%S")
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
@@ -60,12 +59,12 @@ def setup_logging(level: str | None = None) -> None:
 
 
 def add_log_callback(cb: Callable[[str], None]) -> None:
-    _log_cbs.append(cb)
+    _log.append(cb)
 
 
 def remove_log_callback(cb: Callable[[str], None]) -> None:
-    if cb in _log_cbs:
-        _log_cbs.remove(cb)
+    if cb in _log:
+        _log.remove(cb)
 
 
 logger = logging.getLogger("windy")
@@ -79,19 +78,22 @@ class WindyAssistant:
         self._running = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._status_cb: Callable[[str], None] | None = None
+        self._status: Callable[[str], None] | None = None
 
         plugins = load_plugins()
         if plugins:
             logger.info("plugins: %s", ", ".join(plugins))
 
-    def on_status(self, cb: Callable[[str], None] | None) -> None:
-        self._status_cb = cb
+        reminders.set_reminder_callback(lambda msg: self.voice.speak(msg))
+        reminders.start_reminder_service()
 
-    def _set_status(self, s: str) -> None:
-        if self._status_cb:
+    def on_status(self, cb: Callable[[str], None] | None) -> None:
+        self._status = cb
+
+    def _status_set(self, s: str) -> None:
+        if self._status:
             try:
-                self._status_cb(s)
+                self._status(s)
             except Exception:
                 pass
 
@@ -102,26 +104,19 @@ class WindyAssistant:
     def stop(self) -> None:
         self._stop.set()
         self._running = False
-        self._set_status("остановлен")
+        reminders.stop_reminder_service()
+        self._status_set("остановлен")
 
     def reload_settings(self) -> None:
         config.reload_settings()
         self.voice.reload()
         self.brain.reload_prompt()
         setup_logging()
-        logger.info("hot-reload OK")
 
     def startup(self, speak: bool = True) -> None:
-        logger.info(
-            "Windy | wake=%s | whisper=%s/%s/%s | ollama=%s",
-            config.WAKE_WORD,
-            config.WHISPER_MODEL,
-            config.WHISPER_DEVICE,
-            config.WHISPER_COMPUTE_TYPE,
-            config.OLLAMA_MODEL,
-        )
+        logger.info("Windy start | whisper=%s/%s | ollama=%s", config.WHISPER_MODEL, config.WHISPER_DEVICE, config.OLLAMA_MODEL)
         if not self.brain.check_connection():
-            logger.warning("Ollama недоступна")
+            logger.warning("Ollama unavailable")
         if speak:
             try:
                 self.voice.speak(config.STARTUP_GREETING)
@@ -141,66 +136,55 @@ class WindyAssistant:
                 self.voice.speak(config.NO_SPEECH)
             return config.NO_SPEECH
 
-        user_text = self._strip_wake(user_text)
-        if not user_text:
+        clean = self._strip_wake(user_text)
+        if not clean:
             if speak:
                 self.voice.speak(config.CONFIRM_WAKE)
             return config.CONFIRM_WAKE
 
-        logger.info("cmd: %s", user_text)
-        self._set_status("думаю...")
+        logger.info("cmd: %s", clean)
+        self._status_set("думаю...")
 
         try:
-            resp = self.brain.think(user_text)
+            resp = self.brain.think(clean)
         except Exception as exc:
             logger.error("brain: %s", exc)
             if speak:
                 self.voice.speak(config.ERROR_GENERIC)
-            self._set_status("слушаю...")
             return config.ERROR_GENERIC
 
         results: list[str] = []
         if resp.has_actions:
-            self._set_status("выполняю...")
-            try:
-                results = self.tools.execute_all(resp.actions)
-            except Exception as exc:
-                results = [str(exc)]
+            self._status_set("выполняю...")
+            results = self.tools.execute_all(resp.actions)
 
-        speech = resp.speech.strip()
-        if not speech and results:
-            speech = ". ".join(results)
-        if not speech:
-            speech = "Готово."
-
+        speech = resp.speech.strip() or ". ".join(results) or "Готово."
         if speak:
-            self._set_status("говорю...")
+            self._status_set("говорю...")
             try:
                 self.voice.speak(speech)
             except Exception as exc:
                 logger.error("tts: %s", exc)
 
-        self._set_status("слушаю...")
+        history.add_entry(clean, speech)
+        self._status_set("слушаю...")
         return speech
 
     def run_once(self) -> None:
         if self._stop.is_set():
             return
-        self._set_status("жду wake-word...")
+        self._status_set("жду wake-word...")
         if self.voice.wait_for_wake_word():
-            self._set_status("wake-word!")
             self.voice.speak(config.CONFIRM_WAKE)
-            self._set_status("запись...")
+            self._status_set("запись...")
             cmd = self.voice.listen_command()
             self.process_command(cmd)
 
     def run(self) -> None:
         self._running = True
         self._stop.clear()
-        set_wake_callback(lambda: self._set_status("wake-word!"))
+        set_wake_callback(lambda: self._status_set("wake-word!"))
         self.startup()
-        logger.info("Слушаю «Эй Винди» / «Винди»...")
-
         while self._running and not self._stop.is_set():
             try:
                 self.run_once()
@@ -209,16 +193,13 @@ class WindyAssistant:
             except Exception as exc:
                 logger.exception("loop: %s", exc)
                 time.sleep(1)
-
         self._running = False
-        self._set_status("остановлен")
-        logger.info("stopped")
 
     def run_in_thread(self) -> threading.Thread:
         if self._thread and self._thread.is_alive():
             return self._thread
         self._stop.clear()
-        self._thread = threading.Thread(target=self.run, daemon=True, name="Windy")
+        self._thread = threading.Thread(target=self.run, daemon=True)
         self._thread.start()
         return self._thread
 
@@ -228,7 +209,6 @@ def main() -> None:
     parser.add_argument("--gui", action="store_true")
     args = parser.parse_args()
     setup_logging()
-    logger.info("project: %s", PROJECT_DIR)
     if args.gui:
         from gui import run_gui
         run_gui()

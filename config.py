@@ -1,6 +1,5 @@
 """
-Глобальные настройки Windy AI Assistant.
-Загрузка / сохранение settings.json, hot-reload.
+Настройки Windy AI Assistant — settings.json + hot-reload.
 """
 
 from __future__ import annotations
@@ -28,12 +27,10 @@ TELEGRAM_SESSION_PATH = DATA_DIR / "windy_telegram"
 for _d in (TEMP_DIR, LOG_DIR, PLUGINS_DIR, DATA_DIR, PROMPTS_DIR):
     _d.mkdir(exist_ok=True)
 
-# --- Аудио ---
 SAMPLE_RATE = 16_000
 CHANNELS = 1
 DTYPE = "float32"
 
-# --- Строки ассистента ---
 ASSISTANT_NAME = "Винди"
 STARTUP_GREETING = "Винди на связи. Скажи «Эй Винди», когда понадоблюсь."
 ERROR_GENERIC = "Произошла ошибка. Попробуй ещё раз."
@@ -44,14 +41,13 @@ WAKE_CHUNK_SEC = 3.0
 WAKE_POLL_INTERVAL = 0.2
 VAD_CHUNK_MS = 100
 VAD_RMS_SMOOTH_WINDOW = 5
-TTS_RATE = "+0%"
-TTS_VOLUME = "+0%"
+VAD_ENERGY_WEIGHT = 0.35
 TTS_USE_SAPI_FALLBACK = True
 OLLAMA_TIMEOUT = 90
 
-# --- Mutable (из settings.json) ---
+# Mutable
 WAKE_WORD = "винди"
-WAKE_WORD_ALIASES: tuple[str, ...] = ("винди", "эй винди", "hey винди")
+WAKE_WORD_ALIASES: tuple[str, ...] = ()
 WHISPER_MODEL = "small"
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE_TYPE = "int8"
@@ -64,6 +60,8 @@ OLLAMA_NUM_GPU = -1
 OLLAMA_TOP_P = 0.9
 OLLAMA_REPEAT_PENALTY = 1.1
 TTS_VOICE = "ru-RU-DmitryNeural"
+TTS_RATE = "+0%"
+TTS_VOLUME = "+0%"
 VAD_SPEECH_THRESHOLD = 0.012
 VAD_SILENCE_THRESHOLD = 0.006
 VAD_SILENCE_SEC = 2.8
@@ -71,7 +69,7 @@ VAD_HANGOVER_SEC = 1.0
 VAD_MAX_RECORD_SEC = 35.0
 VAD_MIN_SPEECH_SEC = 0.5
 VAD_WAIT_SPEECH_SEC = 12.0
-VAD_PRE_ROLL_SEC = 0.7
+VAD_PRE_ROLL_SEC = 0.8
 POST_TTS_DELAY_SEC = 1.3
 APP_PATHS: dict[str, str] = {}
 STEAM_GAMES: dict[str, str] = {}
@@ -81,8 +79,10 @@ TELEGRAM_API_HASH = ""
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_DEFAULT_CHAT_ID = ""
 TELEGRAM_CHATS: dict[str, str] = {}
+FILE_SEARCH_ROOTS: list[str] = []
 LOG_LEVEL = "INFO"
 PLUGINS_ENABLED = True
+GUI_THEME = "dark"
 
 WHISPER_BEAM_SIZE = 5
 WHISPER_BEST_OF = 3
@@ -92,20 +92,17 @@ WHISPER_LOG_PROB_THRESHOLD = -1.0
 
 
 def _detect_gpu() -> tuple[str, str]:
-    """CUDA + int8 — стабильно на GTX 10xx (без float16)."""
     try:
         import ctranslate2
         if ctranslate2.get_cuda_device_count() > 0:
             return "cuda", "int8"
-    except Exception as exc:
-        logger.debug("CUDA: %s", exc)
+    except Exception:
+        pass
     return "cpu", "int8"
 
 
 def resolve_whisper_backend() -> list[tuple[str, str]]:
-    """Цепочка fallback: запрошенный → cuda/int8 → cpu/int8."""
-    device = WHISPER_DEVICE.lower()
-    compute = WHISPER_COMPUTE_TYPE.lower()
+    device, compute = WHISPER_DEVICE.lower(), WHISPER_COMPUTE_TYPE.lower()
     if device == "auto":
         device, compute = _detect_gpu()
     if compute in ("auto", "float16"):
@@ -116,20 +113,25 @@ def resolve_whisper_backend() -> list[tuple[str, str]]:
     if (device, compute) != ("cpu", "int8"):
         chain.append(("cpu", "int8"))
     seen: set[tuple[str, str]] = set()
-    return [x for x in chain if not (x in seen or seen.add(x))]  # type: ignore[func-returns-value]
+    out: list[tuple[str, str]] = []
+    for x in chain:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 
 def _apply_dict(data: dict[str, Any]) -> None:
     global WAKE_WORD, WAKE_WORD_ALIASES, WHISPER_MODEL, WHISPER_DEVICE
     global WHISPER_COMPUTE_TYPE, WHISPER_LANGUAGE, OLLAMA_HOST, OLLAMA_MODEL
     global OLLAMA_TEMPERATURE, OLLAMA_NUM_CTX, OLLAMA_NUM_GPU, OLLAMA_TOP_P
-    global OLLAMA_REPEAT_PENALTY, TTS_VOICE, VAD_SPEECH_THRESHOLD
-    global VAD_SILENCE_THRESHOLD, VAD_SILENCE_SEC, VAD_HANGOVER_SEC
-    global VAD_MAX_RECORD_SEC, VAD_MIN_SPEECH_SEC, VAD_WAIT_SPEECH_SEC
-    global VAD_PRE_ROLL_SEC, POST_TTS_DELAY_SEC, APP_PATHS, STEAM_GAMES
-    global VPN_TOGGLE_BAT, TELEGRAM_API_ID, TELEGRAM_API_HASH
-    global TELEGRAM_BOT_TOKEN, TELEGRAM_DEFAULT_CHAT_ID, TELEGRAM_CHATS
-    global LOG_LEVEL, PLUGINS_ENABLED
+    global OLLAMA_REPEAT_PENALTY, TTS_VOICE, TTS_RATE, TTS_VOLUME
+    global VAD_SPEECH_THRESHOLD, VAD_SILENCE_THRESHOLD, VAD_SILENCE_SEC
+    global VAD_HANGOVER_SEC, VAD_MAX_RECORD_SEC, VAD_MIN_SPEECH_SEC
+    global VAD_WAIT_SPEECH_SEC, VAD_PRE_ROLL_SEC, POST_TTS_DELAY_SEC
+    global APP_PATHS, STEAM_GAMES, VPN_TOGGLE_BAT, TELEGRAM_API_ID
+    global TELEGRAM_API_HASH, TELEGRAM_BOT_TOKEN, TELEGRAM_DEFAULT_CHAT_ID
+    global TELEGRAM_CHATS, FILE_SEARCH_ROOTS, LOG_LEVEL, PLUGINS_ENABLED, GUI_THEME
 
     WAKE_WORD = str(data.get("wake_word", WAKE_WORD))
     WAKE_WORD_ALIASES = tuple(str(a).lower() for a in data.get("wake_word_aliases", WAKE_WORD_ALIASES))
@@ -138,8 +140,8 @@ def _apply_dict(data: dict[str, Any]) -> None:
     dev = str(data.get("whisper_device", WHISPER_DEVICE)).lower()
     comp = str(data.get("whisper_compute_type", WHISPER_COMPUTE_TYPE)).lower()
     if dev == "auto":
-        WHISPER_DEVICE, auto_c = _detect_gpu()
-        WHISPER_COMPUTE_TYPE = auto_c if comp == "auto" else ("int8" if comp == "float16" else comp)
+        WHISPER_DEVICE, ac = _detect_gpu()
+        WHISPER_COMPUTE_TYPE = ac if comp == "auto" else ("int8" if comp == "float16" else comp)
     else:
         WHISPER_DEVICE = dev
         WHISPER_COMPUTE_TYPE = "int8" if comp in ("auto", "float16") else comp
@@ -153,6 +155,8 @@ def _apply_dict(data: dict[str, Any]) -> None:
     OLLAMA_TOP_P = float(data.get("ollama_top_p", OLLAMA_TOP_P))
     OLLAMA_REPEAT_PENALTY = float(data.get("ollama_repeat_penalty", OLLAMA_REPEAT_PENALTY))
     TTS_VOICE = str(data.get("tts_voice", TTS_VOICE))
+    TTS_RATE = str(data.get("tts_rate", TTS_RATE))
+    TTS_VOLUME = str(data.get("tts_volume", TTS_VOLUME))
 
     VAD_SPEECH_THRESHOLD = float(data.get("vad_speech_threshold", VAD_SPEECH_THRESHOLD))
     VAD_SILENCE_THRESHOLD = float(data.get("vad_silence_threshold", VAD_SILENCE_THRESHOLD))
@@ -172,8 +176,10 @@ def _apply_dict(data: dict[str, Any]) -> None:
     TELEGRAM_BOT_TOKEN = str(data.get("telegram_bot_token", TELEGRAM_BOT_TOKEN))
     TELEGRAM_DEFAULT_CHAT_ID = str(data.get("telegram_default_chat_id", TELEGRAM_DEFAULT_CHAT_ID))
     TELEGRAM_CHATS = {str(k).lower(): str(v) for k, v in (data.get("telegram_chats") or {}).items()}
+    FILE_SEARCH_ROOTS = list(data.get("file_search_roots") or FILE_SEARCH_ROOTS or [str(Path.home() / "Desktop"), str(Path.home() / "Documents")])
     LOG_LEVEL = str(data.get("log_level", LOG_LEVEL))
     PLUGINS_ENABLED = bool(data.get("plugins_enabled", PLUGINS_ENABLED))
+    GUI_THEME = str(data.get("gui_theme", GUI_THEME))
 
 
 def to_dict() -> dict[str, Any]:
@@ -192,6 +198,8 @@ def to_dict() -> dict[str, Any]:
         "ollama_top_p": OLLAMA_TOP_P,
         "ollama_repeat_penalty": OLLAMA_REPEAT_PENALTY,
         "tts_voice": TTS_VOICE,
+        "tts_rate": TTS_RATE,
+        "tts_volume": TTS_VOLUME,
         "vad_speech_threshold": VAD_SPEECH_THRESHOLD,
         "vad_silence_threshold": VAD_SILENCE_THRESHOLD,
         "vad_silence_sec": VAD_SILENCE_SEC,
@@ -209,8 +217,10 @@ def to_dict() -> dict[str, Any]:
         "telegram_bot_token": TELEGRAM_BOT_TOKEN,
         "telegram_default_chat_id": TELEGRAM_DEFAULT_CHAT_ID,
         "telegram_chats": TELEGRAM_CHATS,
+        "file_search_roots": FILE_SEARCH_ROOTS,
         "log_level": LOG_LEVEL,
         "plugins_enabled": PLUGINS_ENABLED,
+        "gui_theme": GUI_THEME,
     }
 
 
@@ -220,14 +230,13 @@ def load_settings(path: Path | None = None) -> None:
         return
     try:
         _apply_dict(json.loads(path.read_text(encoding="utf-8")))
-        logger.info("Настройки загружены")
+        logger.info("settings loaded")
     except Exception as exc:
-        logger.error("settings.json: %s", exc)
+        logger.error("settings: %s", exc)
 
 
 def save_settings(path: Path | None = None) -> None:
-    path = path or SETTINGS_PATH
-    path.write_text(json.dumps(to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    (path or SETTINGS_PATH).write_text(json.dumps(to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def reload_settings() -> None:
