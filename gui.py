@@ -1,8 +1,10 @@
 """
-Windy AI Assistant — современный GUI (CustomTkinter).
+Windy AI Assistant v6 — современный GUI (CustomTkinter).
 
-Дизайн: тёмная тема, карточки, анимация wake-word, live-логи,
-панель настроек со слайдерами, статусы сервисов, история команд.
+Функции:
+  - Анимация wake-word, live-логи, настройки VAD/Whisper
+  - Управление приложениями: автоскан, чекбоксы, ручное добавление
+  - Быстрый запуск из выпадающего меню
 """
 
 from __future__ import annotations
@@ -10,8 +12,8 @@ from __future__ import annotations
 import json
 import math
 import threading
-import time
-from tkinter import messagebox
+from pathlib import Path
+from tkinter import filedialog, messagebox
 
 import bootstrap
 
@@ -19,6 +21,7 @@ bootstrap.ensure_project_path()
 
 import customtkinter as ctk
 
+import app_scanner
 import config
 import history
 from main import WindyAssistant, add_log_callback, remove_log_callback, setup_logging
@@ -26,7 +29,6 @@ from main import WindyAssistant, add_log_callback, remove_log_callback, setup_lo
 setup_logging()
 
 
-# ── Палитра (GitHub-dark inspired) ────────────────────────────────────────────
 class Theme:
     BG = "#0d1117"
     SURFACE = "#161b22"
@@ -65,17 +67,13 @@ _WAKE_STATES = {
 
 
 class StatusPill(ctk.CTkFrame):
-    """Компактный индикатор статуса сервиса."""
-
     def __init__(self, master, label: str, **kwargs) -> None:
         super().__init__(master, fg_color=Theme.SURFACE2, corner_radius=20, **kwargs)
         self._dot = ctk.CTkLabel(self, text="●", font=ctk.CTkFont(size=14), text_color=Theme.MUTED)
         self._dot.pack(side="left", padx=(10, 4), pady=6)
-        ctk.CTkLabel(self, text=label, font=ctk.CTkFont(size=12), text_color=Theme.MUTED).pack(
-            side="left", padx=(0, 4)
-        )
+        ctk.CTkLabel(self, text=label, font=ctk.CTkFont(size=12), text_color=Theme.MUTED).pack(side="left")
         self._val = ctk.CTkLabel(self, text="—", font=ctk.CTkFont(size=12, weight="bold"), text_color=Theme.TEXT)
-        self._val.pack(side="left", padx=(0, 12), pady=6)
+        self._val.pack(side="left", padx=(4, 12), pady=6)
 
     def set(self, ok: bool | None, text: str) -> None:
         color = Theme.SUCCESS if ok else (Theme.DANGER if ok is False else Theme.MUTED)
@@ -90,8 +88,8 @@ class WindyGUI(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title("Windy AI Assistant")
-        self.geometry("1180x780")
-        self.minsize(1000, 680)
+        self.geometry("1220x800")
+        self.minsize(1040, 700)
 
         self.assistant = WindyAssistant()
         self.assistant.on_status(self._on_assistant_status)
@@ -102,6 +100,10 @@ class WindyGUI(ctk.CTk):
         self._pulse_job: str | None = None
         self._health_job: str | None = None
 
+        # Приложения: все найденные + чекбоксы
+        self._scanned_apps: dict[str, str] = {}
+        self._app_checks: dict[str, ctk.CTkCheckBox] = {}
+
         self._build()
         add_log_callback(self._log_fn)
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -110,6 +112,7 @@ class WindyGUI(ctk.CTk):
         self.assistant.voice.set_vad_callback(self._on_vad_state)
 
         self._refresh_history()
+        self._scan_apps_async(initial=True)
         self._start_pulse()
         self._start_health_poll()
 
@@ -118,77 +121,74 @@ class WindyGUI(ctk.CTk):
     def _build(self) -> None:
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
-
         self._build_sidebar()
         self._build_main()
 
     def _build_sidebar(self) -> None:
-        side = ctk.CTkFrame(self, width=240, corner_radius=0, fg_color="#010409", border_width=0)
+        side = ctk.CTkFrame(self, width=250, corner_radius=0, fg_color="#010409")
         side.grid(row=0, column=0, sticky="nsew")
         side.grid_propagate(False)
 
-        # Logo
         logo = ctk.CTkFrame(side, fg_color="transparent")
-        logo.pack(fill="x", padx=20, pady=(24, 8))
+        logo.pack(fill="x", padx=20, pady=(24, 4))
         ctk.CTkLabel(logo, text="🌬", font=ctk.CTkFont(size=32)).pack(side="left")
-        ctk.CTkLabel(
-            logo, text="Windy", font=ctk.CTkFont(size=26, weight="bold"), text_color=Theme.TEXT
-        ).pack(side="left", padx=(8, 0))
-        ctk.CTkLabel(
-            side, text="AI Voice Assistant", font=ctk.CTkFont(size=11), text_color=Theme.MUTED
-        ).pack(anchor="w", padx=24, pady=(0, 16))
+        ctk.CTkLabel(logo, text="Windy", font=ctk.CTkFont(size=26, weight="bold"), text_color=Theme.TEXT).pack(
+            side="left", padx=(8, 0)
+        )
+        ctk.CTkLabel(side, text="AI Voice Assistant v6", font=ctk.CTkFont(size=11), text_color=Theme.MUTED).pack(
+            anchor="w", padx=24, pady=(0, 14)
+        )
 
-        # Control buttons
         self.btn_start = ctk.CTkButton(
             side, text="▶  Запустить", height=42, corner_radius=10,
             fg_color=Theme.ACCENT, hover_color=config.GUI_ACCENT_HOVER,
             font=ctk.CTkFont(size=14, weight="bold"), command=self._start,
         )
         self.btn_start.pack(fill="x", padx=16, pady=4)
-
         self.btn_stop = ctk.CTkButton(
             side, text="■  Остановить", height=42, corner_radius=10,
-            fg_color=Theme.DANGER, hover_color="#da3633", state="disabled",
-            font=ctk.CTkFont(size=14), command=self._stop,
+            fg_color=Theme.DANGER, hover_color="#da3633", state="disabled", command=self._stop,
         )
         self.btn_stop.pack(fill="x", padx=16, pady=4)
-
         self.btn_force = ctk.CTkButton(
             side, text="⚡  Force Wake", height=36, corner_radius=10,
-            fg_color=Theme.SURFACE2, hover_color=Theme.BORDER, border_width=1, border_color=Theme.BORDER,
-            command=self._force_wake,
+            fg_color=Theme.SURFACE2, hover_color=Theme.BORDER,
+            border_width=1, border_color=Theme.BORDER, command=self._force_wake,
         )
-        self.btn_force.pack(fill="x", padx=16, pady=(12, 4))
+        self.btn_force.pack(fill="x", padx=16, pady=(10, 4))
 
-        ctk.CTkLabel(side, text="БЫСТРЫЕ ДЕЙСТВИЯ", font=ctk.CTkFont(size=10, weight="bold"), text_color=Theme.MUTED).pack(
-            anchor="w", padx=20, pady=(20, 6)
+        # Быстрый запуск приложения
+        ctk.CTkLabel(side, text="БЫСТРЫЙ ЗАПУСК", font=ctk.CTkFont(size=10, weight="bold"), text_color=Theme.MUTED).pack(
+            anchor="w", padx=20, pady=(14, 4)
+        )
+        self.cmb_quick_app = ctk.CTkComboBox(side, values=["—"], height=34, command=self._on_quick_app)
+        self.cmb_quick_app.set("—")
+        self.cmb_quick_app.pack(fill="x", padx=16, pady=2)
+        ctk.CTkButton(
+            side, text="Открыть", height=30, fg_color=Theme.SURFACE2,
+            hover_color=Theme.BORDER, command=self._launch_quick_app,
+        ).pack(fill="x", padx=16, pady=(2, 8))
+
+        ctk.CTkLabel(side, text="ТЕСТЫ", font=ctk.CTkFont(size=10, weight="bold"), text_color=Theme.MUTED).pack(
+            anchor="w", padx=20, pady=(8, 4)
         )
         for txt, cmd in [
-            ("🔊 Тест TTS", self._test_tts),
-            ("🎙 Тест Whisper", self._test_whisper),
-            ("🧠 Тест Ollama", self._test_ollama),
-            ("✉️ TG непрочитанные", self._test_unread),
+            ("🔊 TTS", self._test_tts),
+            ("🎙 Whisper", self._test_whisper),
+            ("🧠 Ollama", self._test_ollama),
+            ("✉️ TG unread", self._test_unread),
         ]:
             ctk.CTkButton(
-                side, text=txt, height=32, corner_radius=8,
-                fg_color=Theme.SURFACE2, hover_color=Theme.BORDER, anchor="w",
-                font=ctk.CTkFont(size=12), command=cmd,
+                side, text=txt, height=30, corner_radius=8,
+                fg_color=Theme.SURFACE2, hover_color=Theme.BORDER, anchor="w", command=cmd,
             ).pack(fill="x", padx=16, pady=2)
 
-        ctk.CTkFrame(side, fg_color=Theme.BORDER, height=1).pack(fill="x", padx=16, pady=16)
-
-        ctk.CTkButton(
-            side, text="💾 Сохранить настройки", height=34, corner_radius=8,
-            fg_color=Theme.SUCCESS, hover_color="#2ea043", command=self._save,
-        ).pack(fill="x", padx=16, pady=4)
-        ctk.CTkButton(
-            side, text="🔄 Перезагрузить", height=34, corner_radius=8,
-            fg_color=Theme.SURFACE2, hover_color=Theme.BORDER, command=self._reload,
-        ).pack(fill="x", padx=16, pady=4)
-
-        # Version
-        ctk.CTkLabel(side, text="v5.0", font=ctk.CTkFont(size=10), text_color=Theme.MUTED).pack(
-            side="bottom", pady=16
+        ctk.CTkFrame(side, fg_color=Theme.BORDER, height=1).pack(fill="x", padx=16, pady=12)
+        ctk.CTkButton(side, text="💾 Сохранить всё", height=34, fg_color=Theme.SUCCESS, command=self._save_all).pack(
+            fill="x", padx=16, pady=3
+        )
+        ctk.CTkButton(side, text="🔄 Reload", height=34, fg_color=Theme.SURFACE2, command=self._reload).pack(
+            fill="x", padx=16, pady=3
         )
 
     def _build_main(self) -> None:
@@ -197,13 +197,11 @@ class WindyGUI(ctk.CTk):
         main.grid_columnconfigure(0, weight=1)
         main.grid_rowconfigure(2, weight=1)
 
-        # Status bar
+        # Status pills
         bar = ctk.CTkFrame(main, fg_color=Theme.SURFACE, corner_radius=12, border_width=1, border_color=Theme.BORDER)
-        bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        bar.grid_columnconfigure(3, weight=1)
-
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         pills = ctk.CTkFrame(bar, fg_color="transparent")
-        pills.grid(row=0, column=0, columnspan=4, sticky="ew", padx=12, pady=10)
+        pills.pack(fill="x", padx=12, pady=10)
         self.pill_ollama = StatusPill(pills, "Ollama")
         self.pill_ollama.pack(side="left", padx=(0, 8))
         self.pill_whisper = StatusPill(pills, "Whisper")
@@ -211,41 +209,43 @@ class WindyGUI(ctk.CTk):
         self.pill_telegram = StatusPill(pills, "Telegram")
         self.pill_telegram.pack(side="left")
 
-        # Wake orb + mic
+        # Wake card
         wake_card = ctk.CTkFrame(main, fg_color=Theme.SURFACE, corner_radius=16, border_width=1, border_color=Theme.BORDER)
-        wake_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        wake_card.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         wake_card.grid_columnconfigure(1, weight=1)
 
         orb_frame = ctk.CTkFrame(wake_card, fg_color="transparent", width=120, height=120)
-        orb_frame.grid(row=0, column=0, rowspan=2, padx=20, pady=16)
+        orb_frame.grid(row=0, column=0, rowspan=2, padx=20, pady=14)
         orb_frame.grid_propagate(False)
         self.wake_orb = ctk.CTkFrame(orb_frame, width=88, height=88, corner_radius=44, fg_color=Theme.WAKE_IDLE)
         self.wake_orb.place(relx=0.5, rely=0.5, anchor="center")
-        self.wake_ring = ctk.CTkFrame(orb_frame, width=100, height=100, corner_radius=50, fg_color="transparent", border_width=2, border_color=Theme.WAKE_IDLE)
+        self.wake_ring = ctk.CTkFrame(
+            orb_frame, width=100, height=100, corner_radius=50,
+            fg_color="transparent", border_width=2, border_color=Theme.WAKE_IDLE,
+        )
         self.wake_ring.place(relx=0.5, rely=0.5, anchor="center")
 
         self.lbl_wake_title = ctk.CTkLabel(
             wake_card, text="Ожидание wake-word",
             font=ctk.CTkFont(size=20, weight="bold"), text_color=Theme.TEXT, anchor="w",
         )
-        self.lbl_wake_title.grid(row=0, column=1, sticky="w", padx=(0, 16), pady=(20, 0))
-
+        self.lbl_wake_title.grid(row=0, column=1, sticky="w", pady=(18, 0))
         self.lbl_wake_hint = ctk.CTkLabel(
-            wake_card, text='Скажи «Эй Винди» или нажми Force Wake',
+            wake_card, text='Скажи «Эй Винди» · «Hey Винди» · «Винди»',
             font=ctk.CTkFont(size=13), text_color=Theme.MUTED, anchor="w",
         )
-        self.lbl_wake_hint.grid(row=1, column=1, sticky="w", padx=(0, 16), pady=(4, 0))
+        self.lbl_wake_hint.grid(row=1, column=1, sticky="w", pady=(4, 0))
 
         mic_box = ctk.CTkFrame(wake_card, fg_color=Theme.SURFACE2, corner_radius=10)
-        mic_box.grid(row=0, column=2, rowspan=2, sticky="e", padx=20, pady=16)
-        ctk.CTkLabel(mic_box, text="Микрофон", font=ctk.CTkFont(size=11), text_color=Theme.MUTED).pack(padx=16, pady=(10, 2))
-        self.mic_bar = ctk.CTkProgressBar(mic_box, width=160, height=10, corner_radius=5, progress_color=Theme.ACCENT)
-        self.mic_bar.pack(padx=16, pady=4)
+        mic_box.grid(row=0, column=2, rowspan=2, padx=20, pady=14)
+        ctk.CTkLabel(mic_box, text="Микрофон", text_color=Theme.MUTED, font=ctk.CTkFont(size=11)).pack(padx=14, pady=(8, 2))
+        self.mic_bar = ctk.CTkProgressBar(mic_box, width=170, height=10, progress_color=Theme.ACCENT)
+        self.mic_bar.pack(padx=14, pady=4)
         self.mic_bar.set(0)
-        self.lbl_vad = ctk.CTkLabel(mic_box, text="VAD: —", font=ctk.CTkFont(size=11), text_color=Theme.MUTED)
-        self.lbl_vad.pack(padx=16, pady=(4, 10))
+        self.lbl_vad = ctk.CTkLabel(mic_box, text="VAD: —", text_color=Theme.MUTED, font=ctk.CTkFont(size=11))
+        self.lbl_vad.pack(padx=14, pady=(2, 10))
 
-        # Content: logs + right panel
+        # Content area
         content = ctk.CTkFrame(main, fg_color="transparent")
         content.grid(row=2, column=0, sticky="nsew")
         content.grid_columnconfigure(0, weight=3)
@@ -257,37 +257,33 @@ class WindyGUI(ctk.CTk):
         log_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         log_card.grid_rowconfigure(1, weight=1)
         log_card.grid_columnconfigure(0, weight=1)
-
-        log_hdr = ctk.CTkFrame(log_card, fg_color="transparent")
-        log_hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
-        ctk.CTkLabel(log_hdr, text="Живые логи", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
-        ctk.CTkButton(log_hdr, text="Очистить", width=80, height=26, fg_color=Theme.SURFACE2, command=self._clear_log).pack(side="right")
-
-        self.txt_log = ctk.CTkTextbox(
-            log_card, font=ctk.CTkFont(family="Cascadia Mono", size=11),
-            fg_color=Theme.SURFACE2, text_color=Theme.TEXT, corner_radius=8,
-        )
+        hdr = ctk.CTkFrame(log_card, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        ctk.CTkLabel(hdr, text="Живые логи", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+        ctk.CTkButton(hdr, text="Очистить", width=80, height=26, fg_color=Theme.SURFACE2, command=self._clear_log).pack(side="right")
+        self.txt_log = ctk.CTkTextbox(log_card, font=ctk.CTkFont(family="Consolas", size=11), fg_color=Theme.SURFACE2)
         self.txt_log.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
 
-        # Right: command + history + settings
+        # Tabs
         right = ctk.CTkTabview(content, fg_color=Theme.SURFACE, segmented_button_fg_color=Theme.SURFACE2)
         right.grid(row=0, column=1, sticky="nsew")
         t_cmd = right.add("Команда")
+        t_apps = right.add("Приложения")
         t_hist = right.add("История")
         t_set = right.add("Настройки")
         t_tg = right.add("Telegram")
 
-        # Command tab
-        t_cmd.grid_columnconfigure(0, weight=1)
+        # Command
         ctk.CTkLabel(t_cmd, text="Текстовая команда", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=12, pady=(12, 4))
-        self.entry_cmd = ctk.CTkEntry(t_cmd, placeholder_text="Например: открой хром", height=38, corner_radius=8)
+        self.entry_cmd = ctk.CTkEntry(t_cmd, placeholder_text="Открой телеграм", height=38)
         self.entry_cmd.pack(fill="x", padx=12, pady=4)
         self.entry_cmd.bind("<Return>", lambda _e: self._send_text())
-        ctk.CTkButton(t_cmd, text="Отправить", height=36, fg_color=Theme.ACCENT, command=self._send_text).pack(
-            anchor="w", padx=12, pady=8
-        )
+        ctk.CTkButton(t_cmd, text="Отправить", height=36, fg_color=Theme.ACCENT, command=self._send_text).pack(anchor="w", padx=12, pady=8)
 
-        # History tab
+        # Apps tab
+        self._build_apps_tab(t_apps)
+
+        # History
         t_hist.grid_rowconfigure(0, weight=1)
         t_hist.grid_columnconfigure(0, weight=1)
         self.txt_hist = ctk.CTkTextbox(t_hist, font=ctk.CTkFont(family="Consolas", size=11), fg_color=Theme.SURFACE2)
@@ -296,51 +292,46 @@ class WindyGUI(ctk.CTk):
             row=1, column=0, padx=8, pady=4, sticky="w"
         )
 
-        # Settings tab
+        # Settings
         sf = ctk.CTkScrollableFrame(t_set, fg_color="transparent")
         sf.pack(fill="both", expand=True, padx=4, pady=4)
-
         ctk.CTkLabel(sf, text="VAD чувствительность", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=8, pady=(8, 0))
         self.slider_vad = ctk.CTkSlider(sf, from_=0.1, to=0.95, number_of_steps=17, command=self._on_vad_slider)
         self.slider_vad.set(config.VAD_SENSITIVITY)
         self.slider_vad.pack(fill="x", padx=8, pady=4)
-        self.lbl_vad_val = ctk.CTkLabel(sf, text=f"{config.VAD_SENSITIVITY:.2f}", text_color=Theme.MUTED, font=ctk.CTkFont(size=11))
+        self.lbl_vad_val = ctk.CTkLabel(sf, text=f"{config.VAD_SENSITIVITY:.2f}", text_color=Theme.MUTED)
         self.lbl_vad_val.pack(anchor="w", padx=8)
-
         ctk.CTkLabel(sf, text="Громкость TTS", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=8, pady=(12, 0))
         self.slider_vol = ctk.CTkSlider(sf, from_=-50, to=50, number_of_steps=20, command=self._on_vol_slider)
         vol_num = int(config.TTS_VOLUME.replace("%", "").replace("+", "") or 0)
         self.slider_vol.set(vol_num)
         self.slider_vol.pack(fill="x", padx=8, pady=4)
-        self.lbl_vol_val = ctk.CTkLabel(sf, text=config.TTS_VOLUME, text_color=Theme.MUTED, font=ctk.CTkFont(size=11))
+        self.lbl_vol_val = ctk.CTkLabel(sf, text=config.TTS_VOLUME, text_color=Theme.MUTED)
         self.lbl_vol_val.pack(anchor="w", padx=8)
-
         ctk.CTkLabel(sf, text="Whisper модель", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=8, pady=(12, 0))
         self.cmb_whisper = ctk.CTkComboBox(sf, values=list(config.WHISPER_MODELS), width=200)
         self.cmb_whisper.set(config.WHISPER_MODEL)
         self.cmb_whisper.pack(anchor="w", padx=8, pady=4)
-
         self.vars: dict = {}
-        adv = [
-            ("vad_silence_sec", "Пауза для стопа (сек)", config.VAD_SILENCE_SEC),
+        for key, label, val in [
+            ("vad_silence_sec", "Пауза VAD (сек)", config.VAD_SILENCE_SEC),
             ("vad_hangover_sec", "Hangover (сек)", config.VAD_HANGOVER_SEC),
             ("vad_pre_roll_sec", "Pre-roll (сек)", config.VAD_PRE_ROLL_SEC),
-            ("whisper_device", "Device (auto/cpu/cuda)", config.WHISPER_DEVICE),
+            ("whisper_device", "Whisper device", config.WHISPER_DEVICE),
             ("ollama_model", "Ollama model", config.OLLAMA_MODEL),
-        ]
-        for key, label, val in adv:
+        ]:
             row = ctk.CTkFrame(sf, fg_color="transparent")
             row.pack(fill="x", padx=8, pady=4)
-            ctk.CTkLabel(row, text=label, font=ctk.CTkFont(size=11), width=160, anchor="w").pack(side="left")
-            e = ctk.CTkEntry(row, width=140, height=28)
+            ctk.CTkLabel(row, text=label, width=150, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
+            e = ctk.CTkEntry(row, width=150, height=28)
             e.insert(0, str(val))
             e.pack(side="right")
             self.vars[key] = e
 
-        # Telegram tab
+        # Telegram
         tg = ctk.CTkFrame(t_tg, fg_color="transparent")
         tg.pack(fill="both", expand=True, padx=8, pady=8)
-        self.lbl_tg_status = ctk.CTkLabel(tg, text="Статус: проверка...", text_color=Theme.MUTED)
+        self.lbl_tg_status = ctk.CTkLabel(tg, text="Статус: —", text_color=Theme.MUTED)
         self.lbl_tg_status.pack(anchor="w", pady=(0, 8))
         self.e_api_id = ctk.CTkEntry(tg, placeholder_text="API ID", height=34)
         self.e_api_id.insert(0, str(config.TELEGRAM_API_ID or ""))
@@ -348,13 +339,163 @@ class WindyGUI(ctk.CTk):
         self.e_api_hash = ctk.CTkEntry(tg, placeholder_text="API Hash", height=34)
         self.e_api_hash.insert(0, config.TELEGRAM_API_HASH)
         self.e_api_hash.pack(fill="x", pady=4)
-        self.e_tg_contact = ctk.CTkEntry(tg, placeholder_text="Контакт для теста", height=34)
-        self.e_tg_contact.pack(fill="x", pady=4)
-        ctk.CTkLabel(tg, text="python telegram_client.py — авторизация", text_color=Theme.MUTED, font=ctk.CTkFont(size=11)).pack(anchor="w", pady=4)
         ctk.CTkButton(tg, text="Сохранить", fg_color=Theme.ACCENT, command=self._save_tg).pack(anchor="w", pady=8)
-        ctk.CTkButton(tg, text="Проверить подключение", fg_color=Theme.SURFACE2, command=self._check_tg).pack(anchor="w")
+        ctk.CTkButton(tg, text="Проверить", fg_color=Theme.SURFACE2, command=self._check_tg).pack(anchor="w")
 
-    # ── Animation ─────────────────────────────────────────────────────────────
+    def _build_apps_tab(self, parent) -> None:
+        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        toolbar = ctk.CTkFrame(parent, fg_color="transparent")
+        toolbar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        ctk.CTkLabel(toolbar, text="Приложения для голосовых команд", font=ctk.CTkFont(weight="bold")).pack(side="left")
+        self.lbl_app_count = ctk.CTkLabel(toolbar, text="", text_color=Theme.MUTED, font=ctk.CTkFont(size=11))
+        self.lbl_app_count.pack(side="right", padx=8)
+        self.btn_scan = ctk.CTkButton(
+            toolbar, text="🔄 Обновить список", width=150, height=30,
+            fg_color=Theme.ACCENT, command=lambda: self._scan_apps_async(initial=False),
+        )
+        self.btn_scan.pack(side="right")
+
+        self.apps_scroll = ctk.CTkScrollableFrame(parent, fg_color=Theme.SURFACE2, corner_radius=8)
+        self.apps_scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+
+        add_row = ctk.CTkFrame(parent, fg_color="transparent")
+        add_row.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
+        self.e_app_name = ctk.CTkEntry(add_row, placeholder_text="Имя (chrome)", width=110, height=32)
+        self.e_app_name.pack(side="left", padx=(0, 4))
+        self.e_app_path = ctk.CTkEntry(add_row, placeholder_text="Путь к .exe", height=32)
+        self.e_app_path.pack(side="left", fill="x", expand=True, padx=4)
+        ctk.CTkButton(add_row, text="📁", width=36, height=32, fg_color=Theme.SURFACE2, command=self._browse_app).pack(side="left", padx=2)
+        ctk.CTkButton(add_row, text="+ Добавить", width=100, height=32, fg_color=Theme.SUCCESS, command=self._add_manual_app).pack(side="left", padx=2)
+
+        btn_row = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+        ctk.CTkButton(btn_row, text="Выбрать все", width=110, height=28, fg_color=Theme.SURFACE2, command=self._select_all_apps).pack(side="left", padx=2)
+        ctk.CTkButton(btn_row, text="Снять все", width=110, height=28, fg_color=Theme.SURFACE2, command=self._deselect_all_apps).pack(side="left", padx=2)
+        ctk.CTkButton(btn_row, text="💾 Сохранить приложения", height=28, fg_color=Theme.ACCENT, command=self._save_apps).pack(side="right", padx=2)
+
+    # ── Apps management ───────────────────────────────────────────────────────
+
+    def _scan_apps_async(self, *, initial: bool = False) -> None:
+        def _work():
+            try:
+                scanned = app_scanner.scan_installed_apps()
+                merged = app_scanner.merge_with_manual(scanned, config.APP_PATHS_MANUAL)
+                self.after(0, lambda: self._populate_apps(merged, initial=initial))
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("Сканирование", str(exc)))
+
+        self.btn_scan.configure(state="disabled", text="Сканирую...")
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _populate_apps(self, apps: dict[str, str], *, initial: bool = False) -> None:
+        self._scanned_apps = apps
+        enabled = set(config.APP_PATHS.keys())
+
+        for w in self.apps_scroll.winfo_children():
+            w.destroy()
+        self._app_checks.clear()
+
+        for name, path in apps.items():
+            row = ctk.CTkFrame(self.apps_scroll, fg_color="transparent")
+            row.pack(fill="x", padx=6, pady=3)
+            label = app_scanner.label_for(name)
+            short_path = path if len(path) <= 52 else "…" + path[-50:]
+            checked = name in enabled if initial or name in enabled else name in config.APP_PATHS
+            var = ctk.StringVar(value="on" if checked else "off")
+            cb = ctk.CTkCheckBox(
+                row, text=f"{label}  ({name})", variable=var, onvalue="on", offvalue="off",
+                font=ctk.CTkFont(size=12, weight="bold"),
+            )
+            if checked:
+                cb.select()
+            cb.pack(anchor="w")
+            ctk.CTkLabel(row, text=short_path, text_color=Theme.MUTED, font=ctk.CTkFont(size=10)).pack(anchor="w", padx=28)
+            self._app_checks[name] = cb
+
+        self.lbl_app_count.configure(text=f"{len(apps)} найдено")
+        self.btn_scan.configure(state="normal", text="🔄 Обновить список")
+        self._update_quick_launch()
+
+    def _get_enabled_apps(self) -> dict[str, str]:
+        enabled: dict[str, str] = {}
+        for name, cb in self._app_checks.items():
+            if cb.get() == 1:
+                enabled[name] = self._scanned_apps.get(name, config.APP_PATHS.get(name, ""))
+        return enabled
+
+    def _save_apps(self) -> None:
+        enabled = self._get_enabled_apps()
+        if not enabled:
+            messagebox.showwarning("", "Выбери хотя бы одно приложение")
+            return
+        config.set_app_paths(enabled, config.APP_PATHS_MANUAL)
+        self.assistant.reload_settings()
+        self._update_quick_launch()
+        messagebox.showinfo("Windy", f"Сохранено {len(enabled)} приложений")
+
+    def _add_manual_app(self) -> None:
+        name = self.e_app_name.get().strip().lower()
+        path = self.e_app_path.get().strip()
+        if not name or not path:
+            messagebox.showwarning("", "Укажи имя и путь")
+            return
+        if not path.lower().endswith(".exe") and not path.lower().endswith(".bat"):
+            messagebox.showwarning("", "Укажи путь к .exe")
+            return
+        manual = dict(config.APP_PATHS_MANUAL)
+        manual[name] = path
+        config.APP_PATHS_MANUAL = manual
+        merged = app_scanner.merge_with_manual(self._scanned_apps, manual)
+        if name not in merged:
+            merged[name] = path
+        self._scanned_apps = merged
+        self._populate_apps(merged)
+        self.e_app_name.delete(0, "end")
+        self.e_app_path.delete(0, "end")
+        # Автовыбор нового
+        if name in self._app_checks:
+            self._app_checks[name].select()
+
+    def _browse_app(self) -> None:
+        p = filedialog.askopenfilename(filetypes=[("Executable", "*.exe"), ("All", "*.*")])
+        if p:
+            self.e_app_path.delete(0, "end")
+            self.e_app_path.insert(0, p)
+            if not self.e_app_name.get().strip():
+                self.e_app_name.insert(0, Path(p).stem.lower())
+
+    def _select_all_apps(self) -> None:
+        for cb in self._app_checks.values():
+            cb.select()
+
+    def _deselect_all_apps(self) -> None:
+        for cb in self._app_checks.values():
+            cb.deselect()
+
+    def _update_quick_launch(self) -> None:
+        names = sorted(config.APP_PATHS.keys())
+        labels = [f"{app_scanner.label_for(n)} ({n})" for n in names] or ["—"]
+        self.cmb_quick_app.configure(values=labels)
+        self.cmb_quick_app.set(labels[0])
+
+    def _on_quick_app(self, _choice: str) -> None:
+        pass
+
+    def _launch_quick_app(self) -> None:
+        sel = self.cmb_quick_app.get()
+        if sel == "—":
+            return
+        # Извлекаем alias из "(name)"
+        if "(" in sel and ")" in sel:
+            alias = sel.rsplit("(", 1)[1].rstrip(")")
+        else:
+            alias = sel
+        r = self.assistant.tools.execute("open_app", {"name": alias})
+        self._append_log(f"[quick] {r}")
+
+    # ── Animation & health (from v5) ──────────────────────────────────────────
 
     def _start_pulse(self) -> None:
         self._pulse_tick()
@@ -363,10 +504,8 @@ class WindyGUI(ctk.CTk):
         self._pulse_phase += 0.12
         if self._wake_state in ("idle", "listening"):
             pulse = 0.55 + 0.45 * math.sin(self._pulse_phase)
-            color = Theme.WAKE_IDLE
-            size = int(88 + 6 * pulse)
-            self.wake_orb.configure(fg_color=color, width=size, height=size)
-            self.wake_ring.configure(border_color=color)
+            self.wake_orb.configure(fg_color=Theme.WAKE_IDLE, width=int(88 + 6 * pulse), height=int(88 + 6 * pulse))
+            self.wake_ring.configure(border_color=Theme.WAKE_IDLE)
         elif self._wake_state == "recording":
             pulse = 0.5 + 0.5 * math.sin(self._pulse_phase * 2)
             self.wake_orb.configure(fg_color=Theme.WAKE_RECORD, width=int(90 + 8 * pulse), height=int(90 + 8 * pulse))
@@ -374,7 +513,6 @@ class WindyGUI(ctk.CTk):
         elif self._wake_state == "wake":
             self.wake_orb.configure(fg_color=Theme.WAKE_ACTIVE, width=92, height=92)
             self.wake_ring.configure(border_color=Theme.WAKE_ACTIVE)
-
         self._pulse_job = self.after(50, self._pulse_tick)
 
     def _set_wake_visual(self, state: str) -> None:
@@ -382,8 +520,6 @@ class WindyGUI(ctk.CTk):
         title, color = _WAKE_STATES.get(state, ("—", Theme.MUTED))
         self.lbl_wake_title.configure(text=title)
         self.wake_orb.configure(fg_color=color)
-
-    # ── Health poll ───────────────────────────────────────────────────────────
 
     def _start_health_poll(self) -> None:
         self._poll_health()
@@ -393,20 +529,16 @@ class WindyGUI(ctk.CTk):
         self._health_job = self.after(8000, self._poll_health)
 
     def _health_worker(self) -> None:
-        ollama_ok = self.assistant.brain.check_connection()
-        whisper_st = self.assistant.voice.get_whisper_status()
-        whisper_ok = "ошибка" not in whisper_st.lower()
-        try:
-            import telegram_client as tg
-            tg_ok, tg_msg = tg.check_connection()
-        except Exception as exc:
-            tg_ok, tg_msg = False, str(exc)[:40]
+        health = self.assistant.get_service_health()
 
         def _apply():
-            self.pill_ollama.set(ollama_ok, "OK" if ollama_ok else "offline")
-            self.pill_whisper.set(whisper_ok, whisper_st[:24])
-            self.pill_telegram.set(tg_ok, tg_msg)
-            self.lbl_tg_status.configure(text=f"Telegram: {tg_msg}")
+            o_ok, o_msg = health["ollama"]
+            w_ok, w_msg = health["whisper"]
+            t_ok, t_msg = health["telegram"]
+            self.pill_ollama.set(o_ok, o_msg)
+            self.pill_whisper.set(w_ok, w_msg[:24])
+            self.pill_telegram.set(t_ok, t_msg)
+            self.lbl_tg_status.configure(text=f"Telegram: {t_msg}")
 
         try:
             self.after(0, _apply)
@@ -436,10 +568,8 @@ class WindyGUI(ctk.CTk):
             pass
 
     def _on_mic_level(self, level: float) -> None:
-        def _do():
-            self.mic_bar.set(max(0.0, min(1.0, level)))
         try:
-            self.after(0, _do)
+            self.after(0, lambda: self.mic_bar.set(max(0.0, min(1.0, level))))
         except Exception:
             pass
 
@@ -456,10 +586,8 @@ class WindyGUI(ctk.CTk):
     def _append_log(self, msg: str) -> None:
         def _do():
             self.txt_log.insert("end", msg + "\n")
-            # Ограничение размера лога
-            lines = int(self.txt_log.index("end-1c").split(".")[0])
-            if lines > 400:
-                self.txt_log.delete("1.0", "100.0")
+            if int(self.txt_log.index("end-1c").split(".")[0]) > 400:
+                self.txt_log.delete("1.0", "80.0")
             self.txt_log.see("end")
         try:
             self.after(0, _do)
@@ -471,8 +599,7 @@ class WindyGUI(ctk.CTk):
 
     def _on_vol_slider(self, val: float) -> None:
         v = int(val)
-        sign = "+" if v >= 0 else ""
-        self.lbl_vol_val.configure(text=f"{sign}{v}%")
+        self.lbl_vol_val.configure(text=f"{'+' if v >= 0 else ''}{v}%")
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
@@ -482,12 +609,14 @@ class WindyGUI(ctk.CTk):
     def _refresh_history(self) -> None:
         self.txt_hist.delete("1.0", "end")
         for entry in history.get_history(25):
-            self.txt_hist.insert(
-                "end",
-                f"▸ {entry['time']}\n  {entry['command']}\n  ↳ {entry['response'][:120]}\n\n",
-            )
+            self.txt_hist.insert("end", f"▸ {entry['time']}\n  {entry['command']}\n  ↳ {entry['response'][:120]}\n\n")
 
-    def _save(self) -> None:
+    def _save_all(self) -> None:
+        self._save_settings_only()
+        if self._app_checks:
+            self._save_apps()
+
+    def _save_settings_only(self) -> None:
         data = config.to_dict()
         data["vad_sensitivity"] = round(self.slider_vad.get(), 2)
         vol = int(self.slider_vol.get())
@@ -532,6 +661,7 @@ class WindyGUI(ctk.CTk):
         self.assistant.reload_settings()
         self.cmb_whisper.set(config.WHISPER_MODEL)
         self.slider_vad.set(config.VAD_SENSITIVITY)
+        self._scan_apps_async(initial=True)
         messagebox.showinfo("", "Перезагружено")
 
     def _start(self) -> None:
@@ -563,7 +693,7 @@ class WindyGUI(ctk.CTk):
 
     def _test_ollama(self) -> None:
         ok = self.assistant.brain.check_connection()
-        messagebox.showinfo("Ollama", "Подключено ✓" if ok else "Недоступно — запусти ollama serve")
+        messagebox.showinfo("Ollama", "OK ✓" if ok else "Запусти ollama serve")
 
     def _test_tts(self) -> None:
         threading.Thread(target=lambda: self.assistant.voice.speak("Привет, я Винди"), daemon=True).start()
@@ -573,7 +703,7 @@ class WindyGUI(ctk.CTk):
             try:
                 from voice import _get_whisper
                 _get_whisper()
-                self.after(0, lambda: messagebox.showinfo("Whisper", "Модель загружена ✓"))
+                self.after(0, lambda: messagebox.showinfo("Whisper", "OK ✓"))
             except Exception as exc:
                 self.after(0, lambda: messagebox.showerror("Whisper", str(exc)))
         threading.Thread(target=_w, daemon=True).start()
@@ -604,8 +734,7 @@ class WindyGUI(ctk.CTk):
 
 
 def run_gui() -> None:
-    app = WindyGUI()
-    app.mainloop()
+    WindyGUI().mainloop()
 
 
 if __name__ == "__main__":

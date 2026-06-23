@@ -230,6 +230,13 @@ def _tool_browser_tab(params: dict[str, Any]) -> str:
     return f"Вкладка: {act}"
 
 
+def _tool_list_apps(params: dict[str, Any]) -> str:
+    if not config.APP_PATHS:
+        return "Список приложений пуст — настрой в GUI"
+    lines = [f"{k}: {v}" for k, v in sorted(config.APP_PATHS.items())]
+    return " | ".join(lines[:15])
+
+
 def _tool_open_app(params: dict[str, Any]) -> str:
     name = str(params.get("name") or params.get("app") or "").strip().lower()
     path = params.get("path")
@@ -240,7 +247,7 @@ def _tool_open_app(params: dict[str, Any]) -> str:
         os.startfile(str(p))  # type: ignore[attr-defined]
         return f"Открываю {p.name}"
     if not name:
-        return "Приложение не указано"
+        return "Приложение не указано. Доступны: " + ", ".join(sorted(config.APP_PATHS)[:12])
     app = config.APP_PATHS.get(name)
     try:
         if not app:
@@ -348,6 +355,7 @@ def _tool_noop(params: dict[str, Any]) -> str:
 
 def _register() -> None:
     register_tool("open_app", _tool_open_app, ["open"])
+    register_tool("list_apps", _tool_list_apps)
     register_tool("launch_game", _tool_launch_game, ["launch_steam_game", "open_game"])
     register_tool("open_url", _tool_open_url)
     register_tool("youtube_search", _tool_youtube_search)

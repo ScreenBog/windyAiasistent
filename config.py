@@ -96,6 +96,7 @@ TTS_VOICE = "ru-RU-DmitryNeural"
 TTS_RATE = "+0%"
 TTS_VOLUME = "+0%"
 APP_PATHS: dict[str, str] = {}
+APP_PATHS_MANUAL: dict[str, str] = {}  # добавленные вручную (не перезаписываются сканом)
 STEAM_GAMES: dict[str, str] = {}
 VPN_TOGGLE_BAT = ""
 TELEGRAM_API_ID = 0
@@ -108,7 +109,6 @@ LOG_LEVEL = "INFO"
 PLUGINS_ENABLED = True
 GUI_THEME = "dark"
 GUI_ACCENT = "#3b82f6"
-GUI_ACCENT_HOVER = "#2563eb"
 GUI_ACCENT_HOVER = "#2563eb"
 GUI_SUCCESS = "#22c55e"
 GUI_WARNING = "#f59e0b"
@@ -183,7 +183,7 @@ def _apply_dict(data: dict[str, Any]) -> None:
     global VAD_MIN_SPEECH_SEC, VAD_WAIT_SPEECH_SEC, VAD_PRE_ROLL_SEC
     global VAD_NOISE_MULT_ON, VAD_NOISE_MULT_OFF, VAD_NOISE_CALIBRATION_SEC
     global POST_TTS_DELAY_SEC, MIC_DEVICE_ID
-    global APP_PATHS, STEAM_GAMES, VPN_TOGGLE_BAT, TELEGRAM_API_ID
+    global APP_PATHS, APP_PATHS_MANUAL, STEAM_GAMES, VPN_TOGGLE_BAT, TELEGRAM_API_ID
     global TELEGRAM_API_HASH, TELEGRAM_BOT_TOKEN, TELEGRAM_DEFAULT_CHAT_ID
     global TELEGRAM_CHATS, FILE_SEARCH_ROOTS, LOG_LEVEL, PLUGINS_ENABLED, GUI_THEME, GUI_ACCENT
 
@@ -230,6 +230,9 @@ def _apply_dict(data: dict[str, Any]) -> None:
     MIC_DEVICE_ID = int(mic) if mic is not None and str(mic).strip() != "" else None
 
     APP_PATHS = {str(k).lower(): str(v) for k, v in (data.get("app_paths") or {}).items()}
+    APP_PATHS_MANUAL = {
+        str(k).lower(): str(v) for k, v in (data.get("app_paths_manual") or APP_PATHS_MANUAL or {}).items()
+    }
     STEAM_GAMES = {str(k).lower(): str(v) for k, v in (data.get("steam_games") or {}).items()}
     VPN_TOGGLE_BAT = str(data.get("vpn_toggle_bat", VPN_TOGGLE_BAT))
     TELEGRAM_API_ID = int(data.get("telegram_api_id", TELEGRAM_API_ID) or 0)
@@ -281,6 +284,7 @@ def to_dict() -> dict[str, Any]:
         "post_tts_delay_sec": POST_TTS_DELAY_SEC,
         "mic_device_id": MIC_DEVICE_ID,
         "app_paths": APP_PATHS,
+        "app_paths_manual": APP_PATHS_MANUAL,
         "steam_games": STEAM_GAMES,
         "vpn_toggle_bat": VPN_TOGGLE_BAT,
         "telegram_api_id": TELEGRAM_API_ID,
@@ -313,6 +317,15 @@ def save_settings(path: Path | None = None) -> None:
 
 def reload_settings() -> None:
     load_settings()
+
+
+def set_app_paths(enabled: dict[str, str], manual: dict[str, str] | None = None) -> None:
+    """Обновить список активных приложений и сохранить."""
+    global APP_PATHS, APP_PATHS_MANUAL
+    APP_PATHS = {k.lower(): v for k, v in enabled.items()}
+    if manual is not None:
+        APP_PATHS_MANUAL = {k.lower(): v for k, v in manual.items()}
+    save_settings()
 
 
 load_settings()

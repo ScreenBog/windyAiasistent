@@ -137,8 +137,9 @@ class WindyAssistant:
 
     def startup(self, speak: bool = True) -> None:
         logger.info(
-            "Windy start | whisper=%s/%s | ollama=%s | vad_sens=%.2f",
-            config.WHISPER_MODEL, config.WHISPER_DEVICE, config.OLLAMA_MODEL, config.VAD_SENSITIVITY,
+            "Windy start | whisper=%s/%s | ollama=%s | vad=%.2f | apps=%d",
+            config.WHISPER_MODEL, config.WHISPER_DEVICE, config.OLLAMA_MODEL,
+            config.VAD_SENSITIVITY, len(config.APP_PATHS),
         )
         if not self.brain.check_connection():
             logger.warning("Ollama unavailable — запусти ollama serve")
