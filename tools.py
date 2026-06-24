@@ -60,8 +60,12 @@ def _tg_contact(params: dict[str, Any]) -> str:
     """Контакт из params или default из config."""
     c = str(params.get("contact") or params.get("to") or params.get("name") or "").strip()
     if c:
-        return c
-    return config.TELEGRAM_DEFAULT_CONTACT.strip()
+        mapped = config.TELEGRAM_CHATS.get(c.lower())
+        return mapped or c
+    default = config.TELEGRAM_DEFAULT_CONTACT.strip()
+    if default:
+        return config.TELEGRAM_CHATS.get(default.lower(), default)
+    return ""
 
 
 def _tool_telegram_send_message(params: dict[str, Any]) -> str:
@@ -70,16 +74,42 @@ def _tool_telegram_send_message(params: dict[str, Any]) -> str:
     if not msg:
         return "Сообщение пустое"
     if not contact:
-        return "Укажи контакт (имя, @username или добавь telegram_default_contact в настройках)"
+        return (
+            "Укажи контакт: имя, @username или ID. "
+            "Можно задать telegram_default_contact в GUI → Telegram"
+        )
+
+    use_ui = bool(params.get("ui") or params.get("fallback_ui"))
+    if use_ui:
+        return _tool_telegram_message_ui({"message": msg, "contact": contact})
+
     try:
         import telegram_client as tg
-        if tg.is_configured():
-            result = tg.send_message(contact, msg)
-            if not result.startswith("Ошибка"):
-                return result
-            logger.warning("telethon send: %s", result)
+
+        if not tg.is_configured():
+            logger.info("telegram not configured — UI fallback")
+            return _tool_telegram_message_ui({"message": msg, "contact": contact})
+
+        auth = tg.get_auth_status()
+        if auth.get("state") != "authorized":
+            hint = auth.get("message", "нет авторизации")
+            if params.get("force_ui"):
+                return _tool_telegram_message_ui({"message": msg, "contact": contact})
+            return f"Telegram не авторизован: {hint}. Войди в GUI → Telegram"
+
+        result = tg.send_message(contact, msg)
+        if not result.startswith("Ошибка"):
+            return result
+
+        logger.warning("telethon send failed: %s", result)
+        err_low = result.lower()
+        if any(x in err_low for x in ("не найден", "not found", "flood", "timeout", "authorized")):
+            return result
     except Exception as exc:
-        logger.warning("telethon send fallback: %s", exc)
+        logger.warning("telethon send exception: %s", exc)
+        if not params.get("force_ui"):
+            return f"Ошибка отправки Telegram: {exc}"
+
     return _tool_telegram_message_ui({"message": msg, "contact": contact})
 
 
@@ -87,19 +117,27 @@ def _tool_telegram_message_ui(params: dict[str, Any]) -> str:
     """UI-fallback: открыть Telegram Desktop и напечатать."""
     msg = str(params.get("message") or "").strip()
     contact = str(params.get("contact") or "").strip()
-    _tool_open_app({"name": "telegram"})
-    time.sleep(2)
+    if not msg:
+        return "Сообщение пустое"
+
+    launch = _tool_open_app({"name": "telegram"})
+    if launch.startswith("Приложение") or launch.startswith("Ошибка"):
+        web = _tool_open_browser({"query": "телеграм"})
+        if web.startswith("Ошибка") or web.startswith("Пустой"):
+            return launch
+    time.sleep(2.2)
     import pyautogui
     if contact:
         pyautogui.hotkey("ctrl", "f")
-        time.sleep(0.4)
+        time.sleep(0.45)
         _type_unicode(contact)
-        time.sleep(0.6)
+        time.sleep(0.75)
         pyautogui.press("enter")
-        time.sleep(0.4)
+        time.sleep(0.5)
     _type_unicode(msg, 0.03)
     pyautogui.press("enter")
-    return "Отправлено через UI Telegram"
+    who = f" «{contact}»" if contact else ""
+    return f"Отправлено через UI Telegram{who}"
 
 
 def _tool_telegram_read_last(params: dict[str, Any]) -> str:
@@ -175,6 +213,146 @@ def _tool_telegram_send_voice(params: dict[str, Any]) -> str:
     except Exception as exc:
         logger.error("telegram_send_voice: %s", exc)
         return f"Ошибка голосового: {exc}"
+
+
+# ── Браузер ───────────────────────────────────────────────────────────────────
+
+def _browser_query(params: dict[str, Any]) -> str:
+    return str(
+        params.get("query") or params.get("q") or params.get("name")
+        or params.get("url") or params.get("site") or ""
+    ).strip()
+
+
+def _open_url_in_browser(url: str) -> tuple[bool, str]:
+    """Открыть URL в Chrome (если есть) или системном браузере."""
+    url = (url or "").strip()
+    if not url:
+        return False, "URL пуст"
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    chrome_path, _ = config.resolve_app_path("chrome")
+    if chrome_path:
+        chrome_exe = chrome_path.split(" --")[0].strip()
+        if Path(chrome_exe).exists():
+            try:
+                subprocess.Popen([chrome_exe, url], shell=False)
+                return True, url
+            except Exception as exc:
+                logger.warning("chrome launch failed: %s", exc)
+
+    edge_path, _ = config.resolve_app_path("edge")
+    if edge_path:
+        edge_exe = edge_path.split(" --")[0].strip()
+        if Path(edge_exe).exists():
+            try:
+                subprocess.Popen([edge_exe, url], shell=False)
+                return True, url
+            except Exception as exc:
+                logger.warning("edge launch failed: %s", exc)
+
+    try:
+        webbrowser.open(url)
+        return True, url
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _tool_open_browser(params: dict[str, Any]) -> str:
+    """
+    Умное открытие в браузере: сайты, URL, Google/Яндекс-поиск.
+    prefer_app=true — для steam/discord/telegram сначала пробует .exe.
+    """
+    raw = _browser_query(params)
+    if not raw:
+        sites = ", ".join(config.BROWSER_QUICK_SITES[:8])
+        return f"Пустой запрос. Примеры: {sites}"
+
+    prefer_app = bool(params.get("prefer_app") or params.get("app"))
+    if prefer_app or (config.is_ambiguous_app_site(raw) and not params.get("browser")):
+        app_key = config.normalize_app_name(raw)
+        app_path, key = config.resolve_app_path(app_key or raw)
+        if app_path:
+            ok, detail = _launch_executable(app_path)
+            if ok:
+                return f"Запущено приложение: {key} ({detail})"
+
+    kind, target, label = config.resolve_browser_target(raw)
+    if kind == "empty":
+        return "Пустой запрос для браузера"
+
+    if kind in ("google", "yandex"):
+        base = config.YANDEX_SEARCH_URL if kind == "yandex" else config.GOOGLE_SEARCH_URL
+        url = base + quote_plus(target)
+        ok, opened = _open_url_in_browser(url)
+        engine = "Яндекс" if kind == "yandex" else "Google"
+        return f"{engine}: {target}" if ok else f"Не удалось открыть поиск: {opened}"
+
+    ok, opened = _open_url_in_browser(target)
+    if ok:
+        return f"Открываю {label or opened}"
+    return f"Не удалось открыть браузер: {opened}"
+
+
+def _tool_open_vk(params: dict[str, Any]) -> str:
+    """ВКонтакте — диалоги https://vk.com/im"""
+    section = str(params.get("section") or params.get("page") or "im").strip().lower()
+    url = config.BROWSER_SITES.get("вк", "https://vk.com/im")
+    if section and section not in ("im", "messages", "диалоги", "сообщения"):
+        url = f"https://vk.com/{section.lstrip('/')}"
+    ok, opened = _open_url_in_browser(url)
+    return "Открываю ВКонтакте" if ok else f"Ошибка ВК: {opened}"
+
+
+def _tool_google_search(params: dict[str, Any]) -> str:
+    q = str(params.get("query") or params.get("q") or "").strip()
+    if not q:
+        return "Запрос поиска пуст"
+    return _tool_open_browser({"query": f"поищи в гугле {q}"})
+
+
+def _tool_yandex_search(params: dict[str, Any]) -> str:
+    q = str(params.get("query") or params.get("q") or "").strip()
+    if not q:
+        return "Запрос поиска пуст"
+    return _tool_open_browser({"query": f"поищи в яндексе {q}"})
+
+
+def _open_messenger_for_contact(app_name: str, contact: str) -> str:
+    """Открыть мессенджер и перейти к контакту (для звонков)."""
+    launch = _tool_open_app({"name": app_name})
+    if launch.startswith("Приложение") or launch.startswith("Ошибка"):
+        site = "дискорд" if app_name == "discord" else "телеграм"
+        launch = _tool_open_browser({"query": site, "browser": True})
+    if contact:
+        time.sleep(2.2)
+        import pyautogui
+        pyautogui.hotkey("ctrl", "f")
+        time.sleep(0.45)
+        _type_unicode(contact)
+        time.sleep(0.75)
+        pyautogui.press("enter")
+        time.sleep(0.4)
+    return launch
+
+
+def _tool_telegram_call(params: dict[str, Any]) -> str:
+    """Базовая поддержка звонка: открыть Telegram и чат с контактом."""
+    contact = _tg_contact(params)
+    if not contact:
+        return "Укажи контакт для звонка в Telegram"
+    _open_messenger_for_contact("telegram", contact)
+    return f"Telegram открыт — чат с «{contact}». Нажми кнопку звонка в чате"
+
+
+def _tool_discord_call(params: dict[str, Any]) -> str:
+    """Базовая поддержка звонка: открыть Discord."""
+    contact = str(params.get("contact") or params.get("name") or "").strip()
+    _open_messenger_for_contact("discord", contact)
+    if contact:
+        return f"Discord открыт — найди «{contact}» и начни звонок"
+    return "Discord открыт — выбери друга или голосовой канал для звонка"
 
 
 # ── Система / медиа ───────────────────────────────────────────────────────────
@@ -352,6 +530,10 @@ def _tool_open_app(params: dict[str, Any]) -> str:
         apps = ", ".join(sorted(config.APP_PATHS)[:12]) or "настрой в GUI"
         return f"Приложение не указано. Доступны: {apps}"
 
+    # Сайты и поиск — в браузер, не .exe
+    if not params.get("force_app") and config.should_prefer_browser(raw_name):
+        return _tool_open_browser({"query": raw_name})
+
     app_path, key = config.resolve_app_path(raw_name)
     if not app_path:
         logger.warning("app not found: %r (normalized=%s)", raw_name, config.normalize_app_name(raw_name))
@@ -383,21 +565,20 @@ def _tool_launch_game(params: dict[str, Any]) -> str:
 
 
 def _tool_open_url(params: dict[str, Any]) -> str:
-    url = str(params.get("url") or "").strip()
+    url = str(params.get("url") or params.get("query") or "").strip()
     if not url:
         return "URL пуст"
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    webbrowser.open(url)
-    return f"Открываю {url}"
+    ok, opened = _open_url_in_browser(url)
+    return f"Открываю {opened}" if ok else f"Ошибка URL: {opened}"
 
 
 def _tool_youtube_search(params: dict[str, Any]) -> str:
     q = str(params.get("query") or params.get("q") or "").strip()
     if not q:
         return "Запрос пуст"
-    webbrowser.open(f"https://www.youtube.com/results?search_query={quote_plus(q)}")
-    return f"YouTube: {q}"
+    url = f"https://www.youtube.com/results?search_query={quote_plus(q)}"
+    ok, _ = _open_url_in_browser(url)
+    return f"YouTube: {q}" if ok else "Не удалось открыть YouTube"
 
 
 def _tool_type_text(params: dict[str, Any]) -> str:
@@ -461,6 +642,10 @@ def _register() -> None:
     register_tool("open_app", _tool_open_app, ["open"])
     register_tool("list_apps", _tool_list_apps)
     register_tool("launch_game", _tool_launch_game, ["launch_steam_game", "open_game"])
+    register_tool("open_browser", _tool_open_browser, ["browser", "open_site", "browse"])
+    register_tool("open_vk", _tool_open_vk, ["vk", "вконтакте"])
+    register_tool("google_search", _tool_google_search, ["search_google"])
+    register_tool("yandex_search", _tool_yandex_search, ["search_yandex"])
     register_tool("open_url", _tool_open_url)
     register_tool("youtube_search", _tool_youtube_search)
     register_tool("telegram_send_message", _tool_telegram_send_message, ["telegram_message", "telegram_send"])
@@ -468,6 +653,8 @@ def _register() -> None:
     register_tool("telegram_get_unread", _tool_telegram_get_unread, ["telegram_unread"])
     register_tool("telegram_list_dialogs", _tool_telegram_list_dialogs, ["list_telegram_chats"])
     register_tool("telegram_send_voice", _tool_telegram_send_voice)
+    register_tool("telegram_call", _tool_telegram_call, ["call_telegram", "tg_call"])
+    register_tool("discord_call", _tool_discord_call, ["call_discord"])
     register_tool("type_text", _tool_type_text)
     register_tool("toggle_vpn", _tool_toggle_vpn)
     register_tool("run_command", _tool_run_command)

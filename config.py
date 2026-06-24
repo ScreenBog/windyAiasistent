@@ -126,7 +126,7 @@ PLUGINS_ENABLED = True
 GUI_THEME = "dark"
 GUI_ACCENT = "#6366f1"
 GUI_ACCENT_HOVER = "#4f46e5"
-GUI_VERSION = "v8-beta"
+GUI_VERSION = "v8.1"
 GUI_SUCCESS = "#22c55e"
 GUI_WARNING = "#f59e0b"
 GUI_DANGER = "#ef4444"
@@ -163,6 +163,92 @@ APP_ALIASES: dict[str, str] = {
     "вс код": "code",
 }
 
+# Популярные сайты → URL (для open_browser)
+BROWSER_SITES: dict[str, str] = {
+    "youtube": "https://www.youtube.com",
+    "ютуб": "https://www.youtube.com",
+    "ютюб": "https://www.youtube.com",
+    "vk": "https://vk.com/im",
+    "вк": "https://vk.com/im",
+    "вконтакте": "https://vk.com/im",
+    "вконтакт": "https://vk.com/im",
+    "grok": "https://grok.com",
+    "грок": "https://grok.com",
+    "grok.x.ai": "https://grok.com",
+    "chatgpt": "https://chatgpt.com",
+    "чатгпт": "https://chatgpt.com",
+    "openai": "https://chatgpt.com",
+    "google": "https://www.google.com",
+    "гугл": "https://www.google.com",
+    "гугол": "https://www.google.com",
+    "steam": "https://store.steampowered.com",
+    "стим": "https://store.steampowered.com",
+    "twitch": "https://www.twitch.tv",
+    "твич": "https://www.twitch.tv",
+    "github": "https://github.com",
+    "гитхаб": "https://github.com",
+    "reddit": "https://www.reddit.com",
+    "реддит": "https://www.reddit.com",
+    "twitter": "https://x.com",
+    "твиттер": "https://x.com",
+    "x": "https://x.com",
+    "instagram": "https://www.instagram.com",
+    "инстаграм": "https://www.instagram.com",
+    "discord": "https://discord.com/app",
+    "дискорд": "https://discord.com/app",
+    "telegram": "https://web.telegram.org",
+    "телеграм": "https://web.telegram.org",
+    "телеграмм": "https://web.telegram.org",
+    "yandex": "https://ya.ru",
+    "яндекс": "https://ya.ru",
+    "wikipedia": "https://ru.wikipedia.org",
+    "википедия": "https://ru.wikipedia.org",
+    "netflix": "https://www.netflix.com",
+    "нетфликс": "https://www.netflix.com",
+    "spotify": "https://open.spotify.com",
+    "спотифай": "https://open.spotify.com",
+    "habr": "https://habr.com",
+    "хабр": "https://habr.com",
+}
+
+# Сайты, которые по умолчанию открываем в браузере (не как .exe)
+BROWSER_APP_ALIASES: frozenset[str] = frozenset({
+    "discord", "дискорд", "telegram", "телеграм", "телеграмм", "телега",
+    "steam", "стим", "spotify", "спотифай",
+})
+
+BROWSER_PREFERRED: frozenset[str] = frozenset(
+    k for k in BROWSER_SITES if k not in BROWSER_APP_ALIASES
+)
+
+# Быстрый доступ в GUI (sidebar)
+BROWSER_QUICK_SITES: tuple[str, ...] = (
+    "youtube", "вк", "грок", "google", "steam", "twitch", "github", "chatgpt", "яндекс",
+)
+
+GOOGLE_SEARCH_URL = "https://www.google.com/search?q="
+YANDEX_SEARCH_URL = "https://ya.ru/search/?text="
+
+_BROWSER_PREFIXES = (
+    "открой", "открыть", "откройте", "зайди на", "зайди в", "перейди на", "перейди в",
+    "open", "go to", "launch", "включи сайт", "запусти сайт",
+)
+
+_SEARCH_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("поищи в гугле", "google"),
+    ("поиск в гугле", "google"),
+    ("найди в гугле", "google"),
+    ("поищи в google", "google"),
+    ("найди в google", "google"),
+    ("поищи в яндексе", "yandex"),
+    ("найди в яндексе", "yandex"),
+    ("поищи", "google"),
+    ("найди", "google"),
+    ("загугли", "google"),
+    ("google", "google"),
+    ("гугл", "google"),
+)
+
 # Дефолтные пути (если settings.json пуст)
 DEFAULT_APP_PATHS: dict[str, str] = {
     "chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -175,6 +261,85 @@ DEFAULT_APP_PATHS: dict[str, str] = {
 }
 
 _scanned_cache: dict[str, str] | None = None
+
+
+def normalize_browser_query(query: str) -> str:
+    """Убрать «открой» и лишние слова из запроса браузера."""
+    import re
+    q = (query or "").strip().lower()
+    q = re.sub(r"[^\w\sа-яё.\-/@:]", " ", q, flags=re.I)
+    q = re.sub(r"\s+", " ", q).strip()
+    for prefix in _BROWSER_PREFIXES:
+        if q.startswith(prefix + " "):
+            q = q[len(prefix) + 1 :].strip()
+    for tail in (" в браузере", " сайт", " страницу"):
+        if q.endswith(tail):
+            q = q[: -len(tail)].strip()
+    return q
+
+
+def resolve_browser_target(query: str) -> tuple[str, str, str]:
+    """
+    Разбор запроса open_browser.
+    Возвращает (kind, target, label):
+      kind = url | google | yandex | domain
+    """
+    import re
+    raw = (query or "").strip()
+    if not raw:
+        return "empty", "", ""
+
+    low = raw.lower().strip()
+    # Прямой URL
+    if low.startswith(("http://", "https://")) or re.match(r"^[\w.-]+\.[a-z]{2,}(/|$)", low):
+        url = raw if "://" in raw else f"https://{raw}"
+        return "url", url, url
+
+    q = normalize_browser_query(raw)
+    if not q:
+        return "empty", "", ""
+
+    # Поисковые запросы
+    for prefix, engine in _SEARCH_PREFIXES:
+        if q.startswith(prefix + " "):
+            term = q[len(prefix) + 1 :].strip()
+            if term:
+                if engine == "yandex":
+                    return "yandex", term, f"Яндекс: {term}"
+                return "google", term, f"Google: {term}"
+        if q == prefix:
+            return "url", BROWSER_SITES.get("google", GOOGLE_SEARCH_URL), "Google"
+
+    # Известный сайт
+    if q in BROWSER_SITES:
+        return "url", BROWSER_SITES[q], q
+
+    # Частичное совпадение (youtube music → youtube)
+    for key, url in sorted(BROWSER_SITES.items(), key=lambda x: -len(x[0])):
+        if q == key or q.startswith(key + " ") or key in q.split():
+            return "url", url, key
+
+    # Похоже на домен
+    if "." in q and " " not in q:
+        return "url", f"https://{q}", q
+
+    # Fallback — Google-поиск
+    return "google", q, f"поиск: {q}"
+
+
+def should_prefer_browser(name: str) -> bool:
+    """True если запрос лучше открыть в браузере, а не как приложение."""
+    key = normalize_browser_query(name)
+    if not key:
+        return False
+    return key in BROWSER_PREFERRED
+
+
+def is_ambiguous_app_site(name: str) -> bool:
+    """Сайт, у которого есть и веб-версия, и десктоп-приложение (steam, discord…)."""
+    key = normalize_browser_query(name)
+    app_key = normalize_app_name(name)
+    return key in BROWSER_APP_ALIASES or app_key in BROWSER_APP_ALIASES
 
 
 def normalize_app_name(name: str) -> str:

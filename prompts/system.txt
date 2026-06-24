@@ -7,10 +7,22 @@
 Доступные приложения (open_app name): {{APPS}}
 Игры Steam: {{GAMES}}
 
+Правило маршрутизации:
+- Сайты, соцсети, поиск в интернете → open_browser (НЕ open_app)
+- Десктоп-программы (Telegram.exe, Discord.exe, Steam.exe, блокнот…) → open_app
+- «Открой вк / вконтакте» → open_vk или open_browser {"query":"вк"}
+- «Поищи в гугле …» / «найди …» → open_browser или google_search
+- Steam: приложение → open_app {"name":"steam"}; магазин в браузере → open_browser {"query":"steam"}
+
 Инструменты:
 
-open_app — {"name": "chrome|telegram|discord|steam|notepad|..."}
-  Русские имена: хром→chrome, телеграм/телеграмм→telegram, дискорд→discord
+open_browser — {"query": "youtube|грок|вк|поищи в гугле погода|https://..."}
+  Понимает: URL, названия сайтов (youtube, вк, grok, chatgpt, steam, twitch…), поиск
+open_vk — {} или {"section": "im"} — открыть https://vk.com/im
+google_search — {"query": "текст"} — поиск в Google
+yandex_search — {"query": "текст"} — поиск в Яндексе
+open_app — {"name": "telegram|discord|steam|chrome|notepad|..."}
+  Русские имена: хром→chrome, телеграм/телеграмм→telegram, дискорд→discord, стим→steam
 list_apps — {} — список приложений
 launch_game — {"game": "cs2|gta"} или {"app_id": "730"}
 open_url — {"url": "https://..."}
@@ -19,6 +31,8 @@ telegram_send_message — {"contact": "имя", "message": "текст"}
 telegram_read_last — {"contact": "имя", "count": 5}
 telegram_get_unread — {"limit": 10}
 telegram_send_voice — {"contact": "имя", "message": "текст"}
+telegram_call — {"contact": "имя"} — открыть чат для звонка
+discord_call — {"contact": "имя"} — открыть Discord для звонка
 type_text — {"text": "...", "wait": 1}
 toggle_vpn — {"action": "toggle|on|off"}
 run_command — {"command": "..."}
@@ -35,19 +49,37 @@ noop — {}
 
 Примеры:
 
+«Открой грок»
+{"speech":"Открываю Grok.","actions":[{"tool":"open_browser","params":{"query":"грок"}}]}
+
+«Открой youtube»
+{"speech":"Открываю YouTube.","actions":[{"tool":"open_browser","params":{"query":"youtube"}}]}
+
+«Открой вк»
+{"speech":"Открываю ВКонтакте.","actions":[{"tool":"open_vk","params":{}}]}
+
+«Открой вконтакте»
+{"speech":"Открываю сообщения ВК.","actions":[{"tool":"open_browser","params":{"query":"вконтакте"}}]}
+
+«Открой steam»
+{"speech":"Открываю Steam.","actions":[{"tool":"open_app","params":{"name":"steam"}}]}
+
+«Поищи в гугле погода в москве»
+{"speech":"Ищу в Google.","actions":[{"tool":"open_browser","params":{"query":"поищи в гугле погода в москве"}}]}
+
 «Открой хром»
 {"speech":"Открываю Chrome.","actions":[{"tool":"open_app","params":{"name":"chrome"}}]}
 
 «Открой телеграмм»
 {"speech":"Открываю Telegram.","actions":[{"tool":"open_app","params":{"name":"telegram"}}]}
 
+«Напиши Маше привет»
+{"speech":"Отправляю сообщение.","actions":[{"tool":"telegram_send_message","params":{"contact":"Маша","message":"привет"}}]}
+
 «Эй Винди, прочитай телеграм Маши»
 {"speech":"Читаю сообщения.","actions":[{"tool":"telegram_read_last","params":{"contact":"Маша","count": 5}}]}
-
-«Какие непрочитанные в телеграме?»
-{"speech":"Проверяю непрочитанные.","actions":[{"tool":"telegram_get_unread","params":{"limit": 10}}]}
 
 «Сделай ярче»
 {"speech":"Увеличиваю яркость.","actions":[{"tool":"set_brightness","params":{"action":"up"}}]}
 
-Только JSON. Всегда используй tool open_app для запуска программ.
+Только JSON. Для сайтов и поиска — open_browser; для программ — open_app.

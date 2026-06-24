@@ -1,5 +1,5 @@
 """
-Windy AI Assistant v7 — современный GUI (CustomTkinter).
+Windy AI Assistant v8.1 — современный GUI (CustomTkinter).
 
 Страницы:
   - Главная: wake-word, VAD, быстрая команда
@@ -212,7 +212,13 @@ class WindyGUI(ctk.CTk):
         self.cmb_quick_app = ctk.CTkComboBox(side, values=["—"], height=32)
         self.cmb_quick_app.set("—")
         self.cmb_quick_app.pack(fill="x", padx=16, pady=2)
-        ctk.CTkButton(side, text="Открыть", height=28, fg_color=Theme.SURFACE2, command=self._launch_quick_app).pack(fill="x", padx=16, pady=(2, 8))
+        ctk.CTkButton(side, text="Открыть", height=28, fg_color=Theme.SURFACE2, command=self._launch_quick_app).pack(fill="x", padx=16, pady=(2, 4))
+
+        ctk.CTkLabel(side, text="БЫСТРЫЙ САЙТ", font=ctk.CTkFont(size=9, weight="bold"), text_color=Theme.MUTED).pack(anchor="w", padx=20, pady=(6, 2))
+        self.cmb_quick_site = ctk.CTkComboBox(side, values=list(config.BROWSER_QUICK_SITES), height=32)
+        self.cmb_quick_site.set(config.BROWSER_QUICK_SITES[0])
+        self.cmb_quick_site.pack(fill="x", padx=16, pady=2)
+        ctk.CTkButton(side, text="В браузере", height=28, fg_color=Theme.SURFACE2, command=self._launch_quick_site).pack(fill="x", padx=16, pady=(2, 8))
 
         bottom = ctk.CTkFrame(side, fg_color="transparent")
         bottom.pack(side="bottom", fill="x", padx=16, pady=16)
@@ -292,7 +298,7 @@ class WindyGUI(ctk.CTk):
         cmd_card = ctk.CTkFrame(parent, fg_color=Theme.SURFACE, corner_radius=14, border_width=1, border_color=Theme.BORDER)
         cmd_card.grid(row=2, column=0, sticky="nsew")
         cmd_card.grid_columnconfigure(0, weight=1)
-        cmd_card.grid_rowconfigure(1, weight=1)
+        cmd_card.grid_rowconfigure(2, weight=1)
 
         ch = ctk.CTkFrame(cmd_card, fg_color="transparent")
         ch.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 6))
@@ -300,13 +306,23 @@ class WindyGUI(ctk.CTk):
 
         row = ctk.CTkFrame(cmd_card, fg_color="transparent")
         row.grid(row=0, column=0, sticky="e", padx=16, pady=(14, 6))
-        self.entry_cmd = ctk.CTkEntry(row, placeholder_text="Открой телеграм / прочитай сообщения от …", width=420, height=38)
+        self.entry_cmd = ctk.CTkEntry(row, placeholder_text="Открой грок / вк / поищи в гугле …", width=420, height=38)
         self.entry_cmd.pack(side="left", padx=(0, 8))
         self.entry_cmd.bind("<Return>", lambda _e: self._send_text())
         ctk.CTkButton(row, text="Отправить", width=110, height=38, fg_color=Theme.ACCENT, command=self._send_text).pack(side="left")
 
+        sites_row = ctk.CTkFrame(cmd_card, fg_color="transparent")
+        sites_row.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
+        for site in ("youtube", "вк", "грок", "google", "steam"):
+            ctk.CTkButton(
+                sites_row, text=site, width=72, height=26, corner_radius=8,
+                fg_color=Theme.SURFACE2, hover_color=Theme.BORDER,
+                font=ctk.CTkFont(size=11),
+                command=lambda s=site: self._quick_browser_chip(s),
+            ).pack(side="left", padx=(0, 6))
+
         hist_wrap = ctk.CTkFrame(cmd_card, fg_color=Theme.SURFACE2, corner_radius=10)
-        hist_wrap.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        hist_wrap.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
         hist_wrap.grid_rowconfigure(0, weight=1)
         hist_wrap.grid_columnconfigure(0, weight=1)
         self.txt_hist = ctk.CTkTextbox(hist_wrap, font=ctk.CTkFont(family="Consolas", size=11), fg_color="transparent")
@@ -645,6 +661,25 @@ class WindyGUI(ctk.CTk):
         alias = sel.rsplit("(", 1)[1].rstrip(")") if "(" in sel else sel
         threading.Thread(
             target=lambda: self._append_log(f"[quick] {alias}: {self.assistant.tools.execute('open_app', {'name': alias})}"),
+            daemon=True,
+        ).start()
+
+    def _launch_quick_site(self) -> None:
+        site = self.cmb_quick_site.get().strip()
+        if not site:
+            return
+        threading.Thread(
+            target=lambda: self._append_log(
+                f"[browser] {site}: {self.assistant.tools.execute('open_browser', {'query': site})}"
+            ),
+            daemon=True,
+        ).start()
+
+    def _quick_browser_chip(self, site: str) -> None:
+        threading.Thread(
+            target=lambda: self._append_log(
+                f"[browser] {site}: {self.assistant.tools.execute('open_browser', {'query': site})}"
+            ),
             daemon=True,
         ).start()
 
