@@ -239,17 +239,27 @@ def _tool_list_apps(params: dict[str, Any]) -> str:
 
 
 def _parse_launch_spec(spec: str) -> list[str]:
-    """Разбор 'C:\\path\\app.exe --arg value' в argv для subprocess."""
+    """
+    Разбор команды запуска в argv.
+    ВАЖНО: shlex.split ломает пути с пробелами (C:\\Program Files\\...),
+    поэтому plain .exe пути не токенизируем.
+    """
     spec = spec.strip()
     if not spec:
         return []
-    try:
-        return shlex.split(spec, posix=False)
-    except ValueError:
-        if " --" in spec:
-            exe, rest = spec.split(" --", 1)
-            return [exe.strip(), "--" + rest.strip()]
-        return [spec]
+
+    # Discord-style: "Update.exe --processStart Discord.exe"
+    if " --" in spec:
+        idx = spec.find(" --")
+        exe = spec[:idx].strip()
+        rest = spec[idx:].strip()  # "--processStart Discord.exe"
+        try:
+            return [exe] + shlex.split(rest, posix=False)
+        except ValueError:
+            return [exe, rest]
+
+    # Обычный путь (может содержать пробелы) — одним аргументом
+    return [spec]
 
 
 def _launch_executable(spec: str) -> tuple[bool, str]:
@@ -276,20 +286,24 @@ def _launch_executable(spec: str) -> tuple[bool, str]:
     if not exe_path.exists():
         return False, f"файл не найден: {exe}"
 
+    # Простой exe без аргументов — os.startfile надёжнее на Windows
+    if len(argv) == 1:
+        try:
+            os.startfile(exe)  # type: ignore[attr-defined]
+            logger.info("startfile: %s", exe)
+            return True, exe
+        except Exception as exc:
+            logger.warning("startfile failed %s: %s", exe, exc)
+
     try:
         cwd = str(exe_path.parent) if exe_path.parent.exists() else None
-        proc = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            shell=False,
-            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) or 0,
-        )
-        logger.info("launched %s pid=%s args=%s", exe, proc.pid, argv[1:])
+        proc = subprocess.Popen(argv, cwd=cwd, shell=False)
+        logger.info("launched %s pid=%s argv=%s", exe, proc.pid, argv[1:])
         return True, f"PID {proc.pid}"
     except Exception as exc:
         logger.warning("Popen failed %s: %s — trying shell", spec, exc)
         try:
-            subprocess.Popen(spec, shell=True)
+            subprocess.Popen(f'"{argv[0]}"' + (" " + " ".join(argv[1:]) if len(argv) > 1 else ""), shell=True)
             return True, "shell"
         except Exception as exc2:
             logger.error("launch failed %s: %s", spec, exc2)
