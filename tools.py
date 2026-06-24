@@ -56,15 +56,28 @@ def _type_unicode(text: str, interval: float = 0.04) -> None:
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
+def _tg_contact(params: dict[str, Any]) -> str:
+    """Контакт из params или default из config."""
+    c = str(params.get("contact") or params.get("to") or params.get("name") or "").strip()
+    if c:
+        return c
+    return config.TELEGRAM_DEFAULT_CONTACT.strip()
+
+
 def _tool_telegram_send_message(params: dict[str, Any]) -> str:
     msg = str(params.get("message") or params.get("text") or "").strip()
-    contact = str(params.get("contact") or params.get("to") or "").strip()
+    contact = _tg_contact(params)
     if not msg:
         return "Сообщение пустое"
+    if not contact:
+        return "Укажи контакт (имя, @username или добавь telegram_default_contact в настройках)"
     try:
         import telegram_client as tg
         if tg.is_configured():
-            return tg.send_message(contact, msg)
+            result = tg.send_message(contact, msg)
+            if not result.startswith("Ошибка"):
+                return result
+            logger.warning("telethon send: %s", result)
     except Exception as exc:
         logger.warning("telethon send fallback: %s", exc)
     return _tool_telegram_message_ui({"message": msg, "contact": contact})
@@ -90,28 +103,45 @@ def _tool_telegram_message_ui(params: dict[str, Any]) -> str:
 
 
 def _tool_telegram_read_last(params: dict[str, Any]) -> str:
-    contact = str(params.get("contact") or params.get("to") or "").strip()
-    count = int(params.get("count") or params.get("limit") or 5)
+    contact = _tg_contact(params)
+    count = int(params.get("count") or params.get("limit") or config.TELEGRAM_READ_DEFAULT_COUNT)
     if not contact:
-        return "Укажи контакт (имя, @username или ID)"
+        return "Укажи контакт: имя, @username или ID. Пример: «прочитай сообщения от Маши»"
     try:
         import telegram_client as tg
-        if tg.is_configured():
-            return tg.read_last(contact, count)
+        if not tg.is_configured():
+            return "Настрой Telegram: API ID и Hash в GUI → Telegram"
+        return tg.read_last(contact, count)
     except Exception as exc:
-        return f"Telegram read: {exc}"
-    return "Настрой Telethon: telegram_api_id/hash + python telegram_client.py"
+        logger.error("telegram_read_last: %s", exc)
+        return f"Ошибка чтения Telegram: {exc}"
 
 
 def _tool_telegram_get_unread(params: dict[str, Any]) -> str:
-    limit = int(params.get("limit") or 10)
+    limit = int(params.get("limit") or params.get("count") or 10)
     try:
         import telegram_client as tg
-        if tg.is_configured():
-            return tg.get_unread(limit)
+        if not tg.is_configured():
+            return "Настрой Telegram: API ID и Hash в GUI → Telegram"
+        return tg.get_unread(limit)
     except Exception as exc:
-        return f"Unread: {exc}"
-    return "Настрой Telethon: telegram_api_id/hash + python telegram_client.py"
+        logger.error("telegram_get_unread: %s", exc)
+        return f"Ошибка непрочитанных: {exc}"
+
+
+def _tool_telegram_list_dialogs(params: dict[str, Any]) -> str:
+    limit = int(params.get("limit") or 15)
+    try:
+        import telegram_client as tg
+        if not tg.is_configured():
+            return "Telegram не настроен"
+        dialogs = tg.list_dialogs(limit)
+        if not dialogs:
+            return "Диалоги не найдены или нет авторизации"
+        lines = [f"{d['name']} ({d['unread']} непроч.)" for d in dialogs[:limit]]
+        return " | ".join(lines)
+    except Exception as exc:
+        return f"Ошибка списка чатов: {exc}"
 
 
 def _tool_telegram_send_voice(params: dict[str, Any]) -> str:
@@ -434,8 +464,9 @@ def _register() -> None:
     register_tool("open_url", _tool_open_url)
     register_tool("youtube_search", _tool_youtube_search)
     register_tool("telegram_send_message", _tool_telegram_send_message, ["telegram_message", "telegram_send"])
-    register_tool("telegram_read_last", _tool_telegram_read_last, ["telegram_read"])
-    register_tool("telegram_get_unread", _tool_telegram_get_unread)
+    register_tool("telegram_read_last", _tool_telegram_read_last, ["telegram_read", "read_telegram"])
+    register_tool("telegram_get_unread", _tool_telegram_get_unread, ["telegram_unread"])
+    register_tool("telegram_list_dialogs", _tool_telegram_list_dialogs, ["list_telegram_chats"])
     register_tool("telegram_send_voice", _tool_telegram_send_voice)
     register_tool("type_text", _tool_type_text)
     register_tool("toggle_vpn", _tool_toggle_vpn)

@@ -113,15 +113,20 @@ STEAM_GAMES: dict[str, str] = {}
 VPN_TOGGLE_BAT = ""
 TELEGRAM_API_ID = 0
 TELEGRAM_API_HASH = ""
+TELEGRAM_PHONE = ""                   # +79991234567 для авторизации Telethon
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_DEFAULT_CHAT_ID = ""
-TELEGRAM_CHATS: dict[str, str] = {}
+TELEGRAM_DEFAULT_CONTACT = ""         # имя контакта по умолчанию для read/send
+TELEGRAM_CHATS: dict[str, str] = {}   # alias → chat_id
+TELEGRAM_READ_DEFAULT_COUNT = 5
+TELEGRAM_DIALOGS_LIMIT = 60
 FILE_SEARCH_ROOTS: list[str] = []
 LOG_LEVEL = "INFO"
 PLUGINS_ENABLED = True
 GUI_THEME = "dark"
-GUI_ACCENT = "#3b82f6"
-GUI_ACCENT_HOVER = "#2563eb"
+GUI_ACCENT = "#6366f1"
+GUI_ACCENT_HOVER = "#4f46e5"
+GUI_VERSION = "v7"
 GUI_SUCCESS = "#22c55e"
 GUI_WARNING = "#f59e0b"
 GUI_DANGER = "#ef4444"
@@ -364,8 +369,9 @@ def _apply_dict(data: dict[str, Any]) -> None:
     global POST_TTS_DELAY_SEC, MIC_DEVICE_ID
     global TTS_EDGE_TIMEOUT_SEC, TTS_SAPI_RATE
     global APP_PATHS, APP_PATHS_MANUAL, STEAM_GAMES, VPN_TOGGLE_BAT, TELEGRAM_API_ID
-    global TELEGRAM_API_HASH, TELEGRAM_BOT_TOKEN, TELEGRAM_DEFAULT_CHAT_ID
-    global TELEGRAM_CHATS, FILE_SEARCH_ROOTS, LOG_LEVEL, PLUGINS_ENABLED, GUI_THEME, GUI_ACCENT
+    global TELEGRAM_API_HASH, TELEGRAM_PHONE, TELEGRAM_BOT_TOKEN, TELEGRAM_DEFAULT_CHAT_ID
+    global TELEGRAM_DEFAULT_CONTACT, TELEGRAM_CHATS, TELEGRAM_READ_DEFAULT_COUNT
+    global TELEGRAM_DIALOGS_LIMIT, FILE_SEARCH_ROOTS, LOG_LEVEL, PLUGINS_ENABLED, GUI_THEME, GUI_ACCENT
 
     WAKE_WORD = str(data.get("wake_word", WAKE_WORD))
     WAKE_WORD_ALIASES = tuple(str(a).lower() for a in data.get("wake_word_aliases", WAKE_WORD_ALIASES))
@@ -431,9 +437,13 @@ def _apply_dict(data: dict[str, Any]) -> None:
     VPN_TOGGLE_BAT = str(data.get("vpn_toggle_bat", VPN_TOGGLE_BAT))
     TELEGRAM_API_ID = int(data.get("telegram_api_id", TELEGRAM_API_ID) or 0)
     TELEGRAM_API_HASH = str(data.get("telegram_api_hash", TELEGRAM_API_HASH))
+    TELEGRAM_PHONE = str(data.get("telegram_phone", TELEGRAM_PHONE))
     TELEGRAM_BOT_TOKEN = str(data.get("telegram_bot_token", TELEGRAM_BOT_TOKEN))
     TELEGRAM_DEFAULT_CHAT_ID = str(data.get("telegram_default_chat_id", TELEGRAM_DEFAULT_CHAT_ID))
+    TELEGRAM_DEFAULT_CONTACT = str(data.get("telegram_default_contact", TELEGRAM_DEFAULT_CONTACT))
     TELEGRAM_CHATS = {str(k).lower(): str(v) for k, v in (data.get("telegram_chats") or {}).items()}
+    TELEGRAM_READ_DEFAULT_COUNT = int(data.get("telegram_read_default_count", TELEGRAM_READ_DEFAULT_COUNT) or 5)
+    TELEGRAM_DIALOGS_LIMIT = int(data.get("telegram_dialogs_limit", TELEGRAM_DIALOGS_LIMIT) or 60)
     FILE_SEARCH_ROOTS = list(
         data.get("file_search_roots")
         or FILE_SEARCH_ROOTS
@@ -497,9 +507,13 @@ def to_dict() -> dict[str, Any]:
         "vpn_toggle_bat": VPN_TOGGLE_BAT,
         "telegram_api_id": TELEGRAM_API_ID,
         "telegram_api_hash": TELEGRAM_API_HASH,
+        "telegram_phone": TELEGRAM_PHONE,
         "telegram_bot_token": TELEGRAM_BOT_TOKEN,
         "telegram_default_chat_id": TELEGRAM_DEFAULT_CHAT_ID,
+        "telegram_default_contact": TELEGRAM_DEFAULT_CONTACT,
         "telegram_chats": TELEGRAM_CHATS,
+        "telegram_read_default_count": TELEGRAM_READ_DEFAULT_COUNT,
+        "telegram_dialogs_limit": TELEGRAM_DIALOGS_LIMIT,
         "file_search_roots": FILE_SEARCH_ROOTS,
         "log_level": LOG_LEVEL,
         "plugins_enabled": PLUGINS_ENABLED,

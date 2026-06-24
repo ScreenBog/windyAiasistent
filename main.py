@@ -136,6 +136,11 @@ class WindyAssistant:
         config.invalidate_app_cache()
         self.voice.reload()
         self.brain.reload_prompt()
+        try:
+            import telegram_client as tg
+            tg.reset_client()
+        except Exception:
+            pass
         setup_logging()
 
     def startup(self, speak: bool = True) -> None:

@@ -1,15 +1,31 @@
+# Windy AI Assistant — зависимости
+# Python 3.10+
+
+# STT
 faster-whisper
+ctranslate2
 sounddevice
 scipy
 numpy
+
+# TTS
 edge-tts
 playsound3
-requests
+
+# LLM
 ollama
+requests
+
+# Автоматизация
 pyautogui
-telethon
+
+# Telegram (MTProto)
+telethon>=1.36.0
 cryptg
-customtkinter
+
+# GUI
+customtkinter>=5.2.0
 darkdetect
-ctranslate2
+Pillow
+
 # edge-tts требует сеть; при сбое используется SAPI (Windows)
