@@ -52,25 +52,36 @@ CONFIRM_WAKE = "Слушаю."
 WAKE_CHUNK_SEC = 3.0
 WAKE_POLL_INTERVAL = 0.2
 
-# ── VAD defaults (continuous listening) ───────────────────────────────────────
+# ── VAD defaults (continuous listening) ─────────────────────────────────────
 # Чувствительность 0.0–1.0: выше → легче начать запись, дольше ждёт паузу.
-VAD_SENSITIVITY = 0.55
-VAD_CHUNK_MS = 80
-VAD_RMS_SMOOTH_WINDOW = 6
-VAD_ENERGY_WEIGHT = 0.35
-VAD_NOISE_CALIBRATION_SEC = 0.5
-VAD_NOISE_MULT_ON = 3.0
-VAD_NOISE_MULT_OFF = 1.6
-VAD_SPEECH_THRESHOLD = 0.010
-VAD_SILENCE_THRESHOLD = 0.005
-VAD_SILENCE_SEC = 2.5
-VAD_HANGOVER_SEC = 1.2
-VAD_MAX_RECORD_SEC = 40.0
-VAD_MIN_SPEECH_SEC = 0.45
-VAD_WAIT_SPEECH_SEC = 14.0
-VAD_PRE_ROLL_SEC = 0.9
-POST_TTS_DELAY_SEC = 1.25
-MIC_DEVICE_ID: int | None = None  # None = системный микрофон по умолчанию
+VAD_SENSITIVITY = 0.60
+VAD_CHUNK_MS = 60                    # меньший чанк → точнее границы речи
+VAD_RMS_SMOOTH_WINDOW = 8            # сглаживание RMS (окно чанков)
+VAD_ENERGY_WEIGHT = 0.30             # вес energy в комбинированном уровне
+VAD_PEAK_WEIGHT = 0.15               # вес пика — ловит тихие согласные
+VAD_NOISE_CALIBRATION_SEC = 0.65     # калибровка фонового шума перед записью
+VAD_NOISE_MULT_ON = 2.8              # порог старта = noise × mult
+VAD_NOISE_MULT_OFF = 1.45            # порог тишины (гистерезис)
+VAD_SPEECH_THRESHOLD = 0.008
+VAD_SILENCE_THRESHOLD = 0.004
+VAD_ATTACK_SEC = 0.18                # N чанков подряд выше порога → старт речи
+VAD_RELEASE_SEC = 3.2                # тишина для завершения записи (основной)
+VAD_SILENCE_SEC = 3.2                # alias для GUI / settings.json
+VAD_HANGOVER_SEC = 1.8               # после речи — терпим короткие паузы
+VAD_MAX_RECORD_SEC = 60.0            # макс. длина одной команды
+VAD_MIN_SPEECH_SEC = 0.35
+VAD_WAIT_SPEECH_SEC = 18.0           # ждём начала речи после wake
+VAD_PRE_ROLL_SEC = 1.4               # буфер до детекта речи (не обрезает начало)
+VAD_END_PADDING_SEC = 0.45           # не обрезать хвост речи
+VAD_TRIM_TRAILING = True             # мягкая обрезка хвостовой тишины
+VAD_LONG_SPEECH_BONUS_SEC = 0.8      # длинные фразы → больше терпимости к паузам
+VAD_ADAPTIVE_NOISE_ALPHA = 0.018     # медленная подстройка шума во время записи
+VAD_TTS_OVERLAP_SEC = 2.0            # микрофон открыт во время TTS «Слушаю»
+VAD_MIC_WARMUP_SEC = 0.12            # пауза после открытия потока
+VAD_DEBUG_LOG = False                # логировать уровень громкости (отладка)
+VAD_DEBUG_LOG_INTERVAL_SEC = 0.45
+POST_TTS_DELAY_SEC = 0.0             # устарело: микрофон открывается параллельно TTS
+MIC_DEVICE_ID: int | None = None     # None = системный микрофон по умолчанию
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
 TTS_USE_SAPI_FALLBACK = True
@@ -122,6 +133,8 @@ WHISPER_NO_SPEECH_THRESHOLD = 0.45
 WHISPER_COMPRESSION_RATIO_THRESHOLD = 2.4
 WHISPER_LOG_PROB_THRESHOLD = -1.0
 TTS_EDGE_RETRIES = 3
+TTS_EDGE_TIMEOUT_SEC = 75
+TTS_SAPI_RATE = 0                    # -10..10 (проценты), 0 = по умолчанию
 
 # Русские/разговорные имена → alias в APP_PATHS
 APP_ALIASES: dict[str, str] = {
@@ -276,17 +289,25 @@ def ensure_app_paths() -> None:
         logger.warning("ensure_app_paths: %s", exc)
 
 
-def vad_sensitivity_scale() -> tuple[float, float, float]:
+def vad_sensitivity_scale() -> tuple[float, float, float, float]:
     """
     Масштабирование порогов VAD по чувствительности (0..1).
-    Возвращает (speech_mult, silence_mult, silence_sec_mult).
+    Возвращает (speech_mult, silence_mult, release_sec_mult, attack_mult).
     """
     s = max(0.0, min(1.0, VAD_SENSITIVITY))
-    # Высокая чувствительность → ниже пороги, дольше ждём паузу
-    speech_mult = 1.4 - s * 0.8
-    silence_mult = 1.3 - s * 0.7
-    silence_sec_mult = 0.75 + s * 0.55
-    return speech_mult, silence_mult, silence_sec_mult
+    # Высокая чувствительность → ниже пороги, дольше release, быстрее attack
+    speech_mult = 1.35 - s * 0.75
+    silence_mult = 1.25 - s * 0.65
+    release_sec_mult = 0.80 + s * 0.50
+    attack_mult = 1.25 - s * 0.55
+    return speech_mult, silence_mult, release_sec_mult, attack_mult
+
+
+def vad_release_sec() -> float:
+    """Эффективное время тишины для завершения записи."""
+    _, _, release_m, _ = vad_sensitivity_scale()
+    base = VAD_RELEASE_SEC if VAD_RELEASE_SEC > 0 else VAD_SILENCE_SEC
+    return base * release_m
 
 
 def _detect_gpu() -> tuple[str, str]:
@@ -333,10 +354,15 @@ def _apply_dict(data: dict[str, Any]) -> None:
     global OLLAMA_TEMPERATURE, OLLAMA_NUM_CTX, OLLAMA_NUM_GPU, OLLAMA_TOP_P
     global OLLAMA_REPEAT_PENALTY, TTS_VOICE, TTS_RATE, TTS_VOLUME
     global VAD_SENSITIVITY, VAD_SPEECH_THRESHOLD, VAD_SILENCE_THRESHOLD
-    global VAD_SILENCE_SEC, VAD_HANGOVER_SEC, VAD_MAX_RECORD_SEC
+    global VAD_SILENCE_SEC, VAD_RELEASE_SEC, VAD_HANGOVER_SEC, VAD_MAX_RECORD_SEC
     global VAD_MIN_SPEECH_SEC, VAD_WAIT_SPEECH_SEC, VAD_PRE_ROLL_SEC
+    global VAD_ATTACK_SEC, VAD_END_PADDING_SEC, VAD_TRIM_TRAILING
+    global VAD_LONG_SPEECH_BONUS_SEC, VAD_ADAPTIVE_NOISE_ALPHA
+    global VAD_TTS_OVERLAP_SEC, VAD_MIC_WARMUP_SEC, VAD_DEBUG_LOG
+    global VAD_DEBUG_LOG_INTERVAL_SEC, VAD_PEAK_WEIGHT, VAD_CHUNK_MS
     global VAD_NOISE_MULT_ON, VAD_NOISE_MULT_OFF, VAD_NOISE_CALIBRATION_SEC
     global POST_TTS_DELAY_SEC, MIC_DEVICE_ID
+    global TTS_EDGE_TIMEOUT_SEC, TTS_SAPI_RATE
     global APP_PATHS, APP_PATHS_MANUAL, STEAM_GAMES, VPN_TOGGLE_BAT, TELEGRAM_API_ID
     global TELEGRAM_API_HASH, TELEGRAM_BOT_TOKEN, TELEGRAM_DEFAULT_CHAT_ID
     global TELEGRAM_CHATS, FILE_SEARCH_ROOTS, LOG_LEVEL, PLUGINS_ENABLED, GUI_THEME, GUI_ACCENT
@@ -370,15 +396,29 @@ def _apply_dict(data: dict[str, Any]) -> None:
     VAD_SPEECH_THRESHOLD = float(data.get("vad_speech_threshold", VAD_SPEECH_THRESHOLD))
     VAD_SILENCE_THRESHOLD = float(data.get("vad_silence_threshold", VAD_SILENCE_THRESHOLD))
     VAD_SILENCE_SEC = float(data.get("vad_silence_sec", VAD_SILENCE_SEC))
+    VAD_RELEASE_SEC = float(data.get("vad_release_sec", data.get("vad_silence_sec", VAD_RELEASE_SEC)))
     VAD_HANGOVER_SEC = float(data.get("vad_hangover_sec", VAD_HANGOVER_SEC))
     VAD_MAX_RECORD_SEC = float(data.get("vad_max_record_sec", VAD_MAX_RECORD_SEC))
     VAD_MIN_SPEECH_SEC = float(data.get("vad_min_speech_sec", VAD_MIN_SPEECH_SEC))
     VAD_WAIT_SPEECH_SEC = float(data.get("vad_wait_speech_sec", VAD_WAIT_SPEECH_SEC))
     VAD_PRE_ROLL_SEC = float(data.get("vad_pre_roll_sec", VAD_PRE_ROLL_SEC))
+    VAD_ATTACK_SEC = float(data.get("vad_attack_sec", VAD_ATTACK_SEC))
+    VAD_END_PADDING_SEC = float(data.get("vad_end_padding_sec", VAD_END_PADDING_SEC))
+    VAD_TRIM_TRAILING = bool(data.get("vad_trim_trailing", VAD_TRIM_TRAILING))
+    VAD_LONG_SPEECH_BONUS_SEC = float(data.get("vad_long_speech_bonus_sec", VAD_LONG_SPEECH_BONUS_SEC))
+    VAD_ADAPTIVE_NOISE_ALPHA = float(data.get("vad_adaptive_noise_alpha", VAD_ADAPTIVE_NOISE_ALPHA))
+    VAD_TTS_OVERLAP_SEC = float(data.get("vad_tts_overlap_sec", VAD_TTS_OVERLAP_SEC))
+    VAD_MIC_WARMUP_SEC = float(data.get("vad_mic_warmup_sec", VAD_MIC_WARMUP_SEC))
+    VAD_DEBUG_LOG = bool(data.get("vad_debug_log", VAD_DEBUG_LOG))
+    VAD_DEBUG_LOG_INTERVAL_SEC = float(data.get("vad_debug_log_interval_sec", VAD_DEBUG_LOG_INTERVAL_SEC))
+    VAD_PEAK_WEIGHT = float(data.get("vad_peak_weight", VAD_PEAK_WEIGHT))
+    VAD_CHUNK_MS = int(data.get("vad_chunk_ms", VAD_CHUNK_MS))
     VAD_NOISE_MULT_ON = float(data.get("vad_noise_mult_on", VAD_NOISE_MULT_ON))
     VAD_NOISE_MULT_OFF = float(data.get("vad_noise_mult_off", VAD_NOISE_MULT_OFF))
     VAD_NOISE_CALIBRATION_SEC = float(data.get("vad_noise_calibration_sec", VAD_NOISE_CALIBRATION_SEC))
     POST_TTS_DELAY_SEC = float(data.get("post_tts_delay_sec", POST_TTS_DELAY_SEC))
+    TTS_EDGE_TIMEOUT_SEC = int(data.get("tts_edge_timeout_sec", TTS_EDGE_TIMEOUT_SEC))
+    TTS_SAPI_RATE = int(data.get("tts_sapi_rate", TTS_SAPI_RATE))
 
     mic = data.get("mic_device_id")
     MIC_DEVICE_ID = int(mic) if mic is not None and str(mic).strip() != "" else None
@@ -427,15 +467,29 @@ def to_dict() -> dict[str, Any]:
         "vad_speech_threshold": VAD_SPEECH_THRESHOLD,
         "vad_silence_threshold": VAD_SILENCE_THRESHOLD,
         "vad_silence_sec": VAD_SILENCE_SEC,
+        "vad_release_sec": VAD_RELEASE_SEC,
         "vad_hangover_sec": VAD_HANGOVER_SEC,
         "vad_max_record_sec": VAD_MAX_RECORD_SEC,
         "vad_min_speech_sec": VAD_MIN_SPEECH_SEC,
         "vad_wait_speech_sec": VAD_WAIT_SPEECH_SEC,
         "vad_pre_roll_sec": VAD_PRE_ROLL_SEC,
+        "vad_attack_sec": VAD_ATTACK_SEC,
+        "vad_end_padding_sec": VAD_END_PADDING_SEC,
+        "vad_trim_trailing": VAD_TRIM_TRAILING,
+        "vad_long_speech_bonus_sec": VAD_LONG_SPEECH_BONUS_SEC,
+        "vad_adaptive_noise_alpha": VAD_ADAPTIVE_NOISE_ALPHA,
+        "vad_tts_overlap_sec": VAD_TTS_OVERLAP_SEC,
+        "vad_mic_warmup_sec": VAD_MIC_WARMUP_SEC,
+        "vad_debug_log": VAD_DEBUG_LOG,
+        "vad_debug_log_interval_sec": VAD_DEBUG_LOG_INTERVAL_SEC,
+        "vad_peak_weight": VAD_PEAK_WEIGHT,
+        "vad_chunk_ms": VAD_CHUNK_MS,
         "vad_noise_mult_on": VAD_NOISE_MULT_ON,
         "vad_noise_mult_off": VAD_NOISE_MULT_OFF,
         "vad_noise_calibration_sec": VAD_NOISE_CALIBRATION_SEC,
         "post_tts_delay_sec": POST_TTS_DELAY_SEC,
+        "tts_edge_timeout_sec": TTS_EDGE_TIMEOUT_SEC,
+        "tts_sapi_rate": TTS_SAPI_RATE,
         "mic_device_id": MIC_DEVICE_ID,
         "app_paths": APP_PATHS,
         "app_paths_manual": APP_PATHS_MANUAL,

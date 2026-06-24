@@ -140,9 +140,10 @@ class WindyAssistant:
 
     def startup(self, speak: bool = True) -> None:
         logger.info(
-            "Windy start | whisper=%s/%s | ollama=%s | vad=%.2f | apps=%d",
+            "Windy start | whisper=%s/%s | ollama=%s | vad=%.2f release=%.1fs pre=%.1fs | apps=%d",
             config.WHISPER_MODEL, config.WHISPER_DEVICE, config.OLLAMA_MODEL,
-            config.VAD_SENSITIVITY, len(config.APP_PATHS),
+            config.VAD_SENSITIVITY, config.vad_release_sec(),
+            config.VAD_PRE_ROLL_SEC, len(config.APP_PATHS),
         )
         if not self.brain.check_connection():
             logger.warning("Ollama unavailable — запусти ollama serve")
@@ -211,9 +212,9 @@ class WindyAssistant:
 
         self._set_status("жду wake-word...")
         if self.voice.wait_for_wake_word():
-            self.voice.speak(config.CONFIRM_WAKE)
             self._set_status("запись...")
-            cmd = self.voice.listen_command()
+            # TTS «Слушаю» + VAD параллельно — не обрезаем начало длинной команды
+            cmd = self.voice.listen_after_wake()
             if cmd:
                 self.process_command(cmd)
             else:
@@ -230,9 +231,8 @@ class WindyAssistant:
             logger.info("force wake cycle")
             self._set_status("force wake!")
             self.voice.trigger_force_wake()
-            self.voice.speak(config.CONFIRM_WAKE)
             self._set_status("запись...")
-            cmd = self.voice.listen_command()
+            cmd = self.voice.listen_after_wake()
             if cmd:
                 self.process_command(cmd)
             else:

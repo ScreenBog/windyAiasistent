@@ -46,6 +46,7 @@ class Theme:
 
 
 _VAD_LABELS = {
+    "lead_in": "Микрофон (TTS)",
     "calibrating": "Калибровка шума",
     "waiting": "Ожидание речи",
     "recording": "Запись команды",

@@ -3,8 +3,9 @@
 
 Возможности:
   - Wake-word detection (faster-whisper)
-  - Continuous VAD: RMS + energy, pre-roll, hangover
-  - TTS: edge-tts + SAPI fallback
+  - Continuous VAD v2: RMS + energy + peak, pre-roll, attack/release, hangover
+  - Параллельная запись во время TTS «Слушаю» — не теряется начало фразы
+  - TTS: edge-tts → SAPI (Unicode) → winsound
   - Callbacks для GUI (уровень микрофона, статус VAD)
 """
 
@@ -16,6 +17,7 @@ import logging
 import re
 import subprocess
 import tempfile
+import threading
 import time
 from collections import deque
 from enum import Enum, auto
@@ -43,6 +45,7 @@ _FILLER = re.compile(r"\b(э+|мм+|ну+|ага|угу|типа|как бы)\b"
 
 class VADPhase(Enum):
     """Фазы continuous listening."""
+    LEAD_IN = auto()       # микрофон открыт во время TTS
     CALIBRATING = auto()
     WAITING = auto()
     RECORDING = auto()
@@ -127,11 +130,22 @@ def _energy(audio: np.ndarray) -> float:
     return float(np.mean(np.square(audio, dtype=np.float64)))
 
 
+def _peak(audio: np.ndarray) -> float:
+    if audio.size == 0:
+        return 0.0
+    return float(np.max(np.abs(audio)))
+
+
 def _voice_level(audio: np.ndarray) -> float:
-    """Комбинированный уровень: RMS + sqrt(energy) — устойчивее к фоновому шуму."""
-    r, e = _rms(audio), _energy(audio)
-    w = config.VAD_ENERGY_WEIGHT
-    return (1.0 - w) * r + w * float(np.sqrt(e))
+    """
+    Комбинированный уровень громкости: RMS + sqrt(energy) + peak.
+    Устойчив к фону, но чувствителен к тихим согласным и началу слов.
+    """
+    r, e, p = _rms(audio), _energy(audio), _peak(audio)
+    w_e = config.VAD_ENERGY_WEIGHT
+    w_p = config.VAD_PEAK_WEIGHT
+    w_r = max(0.0, 1.0 - w_e - w_p)
+    return w_r * r + w_e * float(np.sqrt(e)) + w_p * p
 
 
 def _smooth(value: float, buf: deque[float]) -> float:
@@ -162,7 +176,7 @@ def _normalize(audio: np.ndarray, target: float = 0.05) -> np.ndarray:
 def _emit_mic(level: float) -> None:
     if _on_mic_level:
         try:
-            _on_mic_level(min(1.0, level * 25.0))
+            _on_mic_level(min(1.0, level * 22.0))
         except Exception:
             pass
 
@@ -217,28 +231,37 @@ def _record_fixed(sec: float, *, emit_levels: bool = False) -> np.ndarray:
     return np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
 
 
-# ── Continuous VAD ────────────────────────────────────────────────────────────
+# ── Continuous VAD v2 ─────────────────────────────────────────────────────────
 
 class ContinuousVAD:
     """
     Voice Activity Detection для непрерывной записи после wake-word.
 
     Алгоритм:
-      1. Калибровка шума (короткая пауза перед записью)
-      2. Pre-roll ring buffer — не обрезает начало фразы
-      3. Пороги on/off с гистерезисом (адаптивно к шуму + sensitivity)
-      4. Hangover — короткие паузы внутри фразы не завершают запись
-      5. N тихих чанков подряд → конец записи
+      1. Lead-in — микрофон уже пишет во время TTS «Слушаю»
+      2. Калибровка шума (медиана уровня фона)
+      3. Pre-roll ring buffer — не обрезает начало фразы
+      4. Attack — N чанков подряд выше порога → старт записи
+      5. Release + hangover — короткие паузы внутри фразы не завершают запись
+      6. Адаптивный noise floor во время ожидания/записи
+      7. Мягкая обрезка хвостовой тишины + end padding
     """
 
-    def __init__(self) -> None:
-        self.chunk_n = int(config.SAMPLE_RATE * config.VAD_CHUNK_MS / 1000)
-        self.dt = config.VAD_CHUNK_MS / 1000.0
-        self.pre_max = max(1, int(config.VAD_PRE_ROLL_SEC / self.dt))
-        speech_m, silence_m, silence_sec_m = config.vad_sensitivity_scale()
-        self.silence_sec = config.VAD_SILENCE_SEC * silence_sec_m
-        self.silent_need = max(5, int(self.silence_sec / self.dt))
-        self.hang_extra = max(2, int(config.VAD_HANGOVER_SEC / self.dt))
+    def __init__(self, *, lead_in_sec: float = 0.0) -> None:
+        self.chunk_n = max(32, int(config.SAMPLE_RATE * config.VAD_CHUNK_MS / 1000))
+        self.dt = self.chunk_n / config.SAMPLE_RATE
+
+        speech_m, silence_m, release_m, attack_m = config.vad_sensitivity_scale()
+        self.release_sec = config.vad_release_sec()
+        self.release_chunks = max(6, int(self.release_sec / self.dt))
+        self.hang_extra = max(3, int(config.VAD_HANGOVER_SEC / self.dt))
+        self.long_speech_bonus_chunks = max(0, int(config.VAD_LONG_SPEECH_BONUS_SEC / self.dt))
+
+        attack_sec = max(0.08, config.VAD_ATTACK_SEC * attack_m)
+        self.attack_need = max(2, int(attack_sec / self.dt))
+
+        pre_sec = config.VAD_PRE_ROLL_SEC + max(0.0, lead_in_sec)
+        self.pre_max = max(2, int(pre_sec / self.dt))
 
         self.noise_floor = 0.0
         self.thr_on = config.VAD_SPEECH_THRESHOLD * speech_m
@@ -248,143 +271,222 @@ class ContinuousVAD:
         self.pre_roll: deque[np.ndarray] = deque(maxlen=self.pre_max)
         self.smooth_buf: deque[float] = deque(maxlen=config.VAD_RMS_SMOOTH_WINDOW)
 
-        self.phase = VADPhase.CALIBRATING
+        self.phase = VADPhase.LEAD_IN if lead_in_sec > 0 else VADPhase.CALIBRATING
+        self.lead_in_left = max(0.0, lead_in_sec)
         self.started = False
+        self.speech_streak = 0
         self.speech_t = 0.0
         self.wait_t = 0.0
         self.total_t = 0.0
         self.silent_run = 0
         self.last_voice_t = 0.0
-        self.calib_chunks = max(1, int(config.VAD_NOISE_CALIBRATION_SEC / self.dt))
+        self.calib_chunks = max(2, int(config.VAD_NOISE_CALIBRATION_SEC / self.dt))
         self.calib_done = 0
         self.calib_levels: list[float] = []
+        self._last_debug_t = 0.0
+        self._end_reason = ""
 
     def _update_thresholds(self) -> None:
-        speech_m, silence_m, _ = config.vad_sensitivity_scale()
+        speech_m, silence_m, _, _ = config.vad_sensitivity_scale()
         base = max(self.noise_floor, 1e-5)
-        self.thr_on = max(
-            config.VAD_SPEECH_THRESHOLD * speech_m,
-            base * config.VAD_NOISE_MULT_ON,
-        )
+        self.thr_on = max(config.VAD_SPEECH_THRESHOLD * speech_m, base * config.VAD_NOISE_MULT_ON)
         self.thr_off = max(
             config.VAD_SILENCE_THRESHOLD * silence_m,
             base * config.VAD_NOISE_MULT_OFF,
+            self.thr_on * 0.55,  # гистерезис: off < on
         )
-        logger.debug("VAD thresholds: noise=%.5f on=%.5f off=%.5f", self.noise_floor, self.thr_on, self.thr_off)
+        logger.info(
+            "VAD calibrated: noise=%.5f thr_on=%.5f thr_off=%.5f release=%.1fs hang=%.1fs",
+            self.noise_floor, self.thr_on, self.thr_off, self.release_sec, config.VAD_HANGOVER_SEC,
+        )
 
-    def _calibrate(self, level: float) -> bool:
-        """Собираем уровень фонового шума перед ожиданием речи."""
+    def _adapt_noise(self, level: float) -> None:
+        """Медленная подстройка порога к изменению фонового шума."""
+        alpha = config.VAD_ADAPTIVE_NOISE_ALPHA
+        if alpha <= 0:
+            return
+        self.noise_floor = (1.0 - alpha) * self.noise_floor + alpha * level
+        self._update_thresholds()
+
+    def _calibrate_sample(self, level: float, *, defer_waiting: bool = False) -> bool:
+        """Собрать фоновый шум. defer_waiting=True — не выходить из lead-in раньше TTS."""
         self.calib_levels.append(level)
         self.calib_done += 1
         if self.calib_done < self.calib_chunks:
             return False
-        self.noise_floor = float(np.median(self.calib_levels)) if self.calib_levels else level
+        self.noise_floor = float(np.percentile(self.calib_levels, 30)) if self.calib_levels else level
         self._update_thresholds()
-        self.phase = VADPhase.WAITING
-        _emit_vad("waiting")
+        if not defer_waiting:
+            self.phase = VADPhase.WAITING
+            _emit_vad("waiting")
         return True
 
+    def _debug_log(self, level: float) -> None:
+        if not config.VAD_DEBUG_LOG:
+            return
+        if self.total_t - self._last_debug_t < config.VAD_DEBUG_LOG_INTERVAL_SEC:
+            return
+        self._last_debug_t = self.total_t
+        logger.info(
+            "VAD [%s] lvl=%.5f on=%.5f off=%.5f streak=%d silent=%d speech=%.1fs",
+            self.phase.name, level, self.thr_on, self.thr_off,
+            self.speech_streak, self.silent_run, self.speech_t,
+        )
+
     def _in_hangover(self) -> bool:
-        """Hangover: недавно была речь — требуем больше тихих чанков для стопа."""
         return (self.total_t - self.last_voice_t) < config.VAD_HANGOVER_SEC
 
+    def _release_threshold_chunks(self) -> int:
+        """Сколько тихих чанков нужно для завершения записи."""
+        extra = self.hang_extra if self._in_hangover() else 0
+        if self.speech_t >= 5.0:
+            extra += self.long_speech_bonus_chunks
+        return self.release_chunks + extra
+
+    def _begin_recording(self, level: float) -> None:
+        self.started = True
+        self.phase = VADPhase.RECORDING
+        self.recorded.extend(self.pre_roll)
+        self.pre_roll.clear()
+        self.speech_t = 0.0
+        self.silent_run = 0
+        self.last_voice_t = self.total_t
+        self.speech_streak = 0
+        _emit_vad("recording")
+        logger.info("VAD speech start level=%.5f pre_roll=%.2fs", level, len(self.recorded) * self.dt)
+
+    def _finish(self, reason: str) -> bool:
+        self.phase = VADPhase.DONE
+        self._end_reason = reason
+        _emit_vad(reason)
+        dur = len(self.recorded) * self.dt if self.recorded else 0.0
+        logger.info(
+            "VAD end [%s] speech=%.1fs recorded=%.1fs silent_run=%d",
+            reason, self.speech_t, dur, self.silent_run,
+        )
+        return True
+
     def process_chunk(self, data: np.ndarray) -> bool:
-        """
-        Обработать один аудио-чанк.
-        Возвращает True, если запись завершена.
-        """
+        """Обработать один аудио-чанк. True = запись завершена."""
         level = _smooth(_voice_level(data), self.smooth_buf)
         _emit_mic(level)
         self.total_t += self.dt
+        self._debug_log(level)
 
+        # ── Lead-in: пишем pre-roll пока играет TTS ──
+        if self.phase == VADPhase.LEAD_IN:
+            self.pre_roll.append(data)
+            self.lead_in_left -= self.dt
+            self._calibrate_sample(level, defer_waiting=True)
+            if self.lead_in_left <= 0:
+                if self.calib_done < self.calib_chunks:
+                    self.phase = VADPhase.CALIBRATING
+                    _emit_vad("calibrating")
+                else:
+                    self.phase = VADPhase.WAITING
+                    _emit_vad("waiting")
+            return False
+
+        # ── Калибровка шума ──
         if self.phase == VADPhase.CALIBRATING:
-            self.pre_roll.append(data)  # pre-roll с калибровки — не теряем начало фразы
-            if self._calibrate(level):
+            self.pre_roll.append(data)
+            if self._calibrate_sample(level):
                 pass
             return False
 
+        # ── Ожидание начала речи (attack) ──
         if not self.started:
             self.wait_t += self.dt
-            self.pre_roll.append(data)  # pre-roll: сохраняем аудио до детекта речи
+            self.pre_roll.append(data)
+
             if level >= self.thr_on:
-                self.started = True
-                self.phase = VADPhase.RECORDING
-                self.recorded.extend(self.pre_roll)
-                self.pre_roll.clear()
-                self.speech_t = 0.0
-                self.silent_run = 0
-                self.last_voice_t = self.total_t
-                _emit_vad("recording")
-                logger.debug("VAD speech start level=%.5f", level)
+                self.speech_streak += 1
+            else:
+                self.speech_streak = max(0, self.speech_streak - 1)
+                self._adapt_noise(level)
+
+            if self.speech_streak >= self.attack_need:
+                self._begin_recording(level)
             elif self.wait_t >= config.VAD_WAIT_SPEECH_SEC:
-                self.phase = VADPhase.DONE
-                _emit_vad("timeout")
-                return True
+                return self._finish("timeout")
             return False
 
-        # Активная запись
+        # ── Активная запись (release + hangover) ──
         self.recorded.append(data)
         self.speech_t += self.dt
 
-        if level < self.thr_off:
-            self.silent_run += 1
-        else:
+        if level >= self.thr_off:
             self.silent_run = 0
             self.last_voice_t = self.total_t
+        else:
+            self.silent_run += 1
+            if self.silent_run % 8 == 0:
+                self._adapt_noise(level)
 
-        need_silent = self.silent_need + (self.hang_extra if self._in_hangover() else 0)
-        if self.silent_run >= need_silent and self.speech_t >= config.VAD_MIN_SPEECH_SEC:
-            self.phase = VADPhase.DONE
-            _emit_vad("done")
-            logger.debug("VAD end speech=%.1fs silent_chunks=%d", self.speech_t, self.silent_run)
-            return True
+        if self.silent_run >= self._release_threshold_chunks() and self.speech_t >= config.VAD_MIN_SPEECH_SEC:
+            return self._finish("done")
 
         if self.total_t >= config.VAD_MAX_RECORD_SEC:
-            self.phase = VADPhase.DONE
-            _emit_vad("max_duration")
-            return True
+            return self._finish("max_duration")
 
         return False
 
     def _trim_trailing_silence(self, audio: np.ndarray) -> np.ndarray:
-        """Убираем хвостовую тишину, оставляя hangover-паузу внутри фразы."""
-        if audio.size < self.chunk_n * 2:
+        """Мягкая обрезка хвоста — не срезаем конец слов."""
+        if not config.VAD_TRIM_TRAILING or audio.size < self.chunk_n * 3:
             return audio
-        tail_allow = max(1, int(0.35 / self.dt))  # ~350 мс тишины в конце
-        levels = []
+
+        levels: list[float] = []
         for i in range(0, len(audio) - self.chunk_n, self.chunk_n):
             levels.append(_voice_level(audio[i : i + self.chunk_n]))
+
         cut_chunks = 0
         for lvl in reversed(levels):
             if lvl < self.thr_off:
                 cut_chunks += 1
             else:
                 break
-        cut_chunks = max(0, cut_chunks - tail_allow)
+
+        # Оставляем 40% хвостовой тишины + end padding
+        keep_tail = max(1, int(0.4 / self.dt))
+        cut_chunks = max(0, cut_chunks - keep_tail)
         if cut_chunks <= 0:
             return audio
+
         cut_samples = cut_chunks * self.chunk_n
-        return audio[: max(self.chunk_n, len(audio) - cut_samples)]
+        pad = int(config.VAD_END_PADDING_SEC * config.SAMPLE_RATE)
+        end = max(self.chunk_n * 2, len(audio) - cut_samples + pad)
+        return audio[: min(len(audio), end)]
 
     def get_audio(self) -> np.ndarray:
         if not self.recorded:
             return np.array([], dtype=np.float32)
-        audio = self._trim_trailing_silence(np.concatenate(self.recorded))
-        return _normalize(_highpass(audio))
+        audio = np.concatenate(self.recorded)
+        audio = self._trim_trailing_silence(audio)
+        out = _normalize(_highpass(audio))
+        logger.info(
+            "VAD audio ready: %.2fs rms=%.5f reason=%s",
+            out.size / config.SAMPLE_RATE, _rms(out), self._end_reason or "—",
+        )
+        return out
 
 
-def record_continuous() -> np.ndarray:
-    """Запись команды после wake-word с continuous VAD."""
-    vad = ContinuousVAD()
-    _emit_vad("calibrating")
+def record_continuous(*, lead_in_sec: float = 0.0) -> np.ndarray:
+    """Запись команды с continuous VAD. lead_in_sec — буфер во время TTS."""
+    vad = ContinuousVAD(lead_in_sec=lead_in_sec)
+    if vad.phase == VADPhase.CALIBRATING:
+        _emit_vad("calibrating")
+    elif vad.phase == VADPhase.LEAD_IN:
+        _emit_vad("lead_in")
+
     chunk_n = vad.chunk_n
-
     try:
+        time.sleep(config.VAD_MIC_WARMUP_SEC)
         with sd.InputStream(blocksize=chunk_n, **_sd_kwargs()) as stream:
             while vad.phase != VADPhase.DONE:
                 chunk, overflowed = stream.read(chunk_n)
                 if overflowed:
-                    logger.warning("audio buffer overflow")
+                    logger.warning("audio buffer overflow — увеличь buffer в ОС")
                 data = np.asarray(chunk, dtype=np.float32).flatten()
                 if vad.process_chunk(data):
                     break
@@ -417,7 +519,11 @@ def _transcribe_once(audio: np.ndarray, *, vad_filter: bool) -> str:
         beam_size=config.WHISPER_BEAM_SIZE,
         best_of=config.WHISPER_BEST_OF,
         vad_filter=vad_filter,
-        vad_parameters={"min_silence_duration_ms": 350, "speech_pad_ms": 450},
+        vad_parameters={
+            "min_silence_duration_ms": 500,
+            "speech_pad_ms": 600,
+            "threshold": 0.35,
+        },
         no_speech_threshold=min(config.WHISPER_NO_SPEECH_THRESHOLD, 0.55),
         condition_on_previous_text=False,
         temperature=0.0,
@@ -429,25 +535,26 @@ def _transcribe_once(audio: np.ndarray, *, vad_filter: bool) -> str:
 
 
 def transcribe(audio: np.ndarray) -> str:
-    if audio is None or audio.size < int(config.SAMPLE_RATE * 0.15):
-        logger.debug("STT: audio too short")
+    if audio is None or audio.size < int(config.SAMPLE_RATE * 0.12):
+        logger.debug("STT: audio too short (%.2fs)", (audio.size if audio is not None else 0) / config.SAMPLE_RATE)
         return ""
 
     audio = _normalize(_highpass(audio))
     rms = _rms(audio)
-    if rms < config.VAD_SILENCE_THRESHOLD * 0.08:
+    if rms < config.VAD_SILENCE_THRESHOLD * 0.06:
         logger.debug("STT: audio too quiet rms=%.5f", rms)
         return ""
 
-    # Padding — Whisper лучше распознаёт с небольшими паузами по краям
-    pad = int(config.SAMPLE_RATE * 0.25)
+    # Padding — Whisper лучше распознаёт длинные фразы с паузами по краям
+    pad = int(config.SAMPLE_RATE * 0.35)
     audio_padded = np.pad(audio, (pad, pad), mode="constant")
 
     try:
+        # Сначала без whisper-vad — наш VAD уже выделил речь
         for attempt, (data, use_vad) in enumerate([
-            (audio_padded, True),
             (audio_padded, False),
             (audio, False),
+            (audio_padded, True),
         ]):
             try:
                 text = _transcribe_once(data, vad_filter=use_vad)
@@ -484,9 +591,42 @@ def listen_chunk(sec: float | None = None) -> str:
 
 
 def listen_command() -> str:
-    """Пауза после TTS «Слушаю», затем continuous VAD + STT."""
-    time.sleep(config.POST_TTS_DELAY_SEC)
+    """Continuous VAD без TTS (если «Слушаю» уже произнесено)."""
+    delay = max(0.0, config.POST_TTS_DELAY_SEC)
+    if delay > 0:
+        time.sleep(delay)
     return transcribe(record_continuous())
+
+
+def listen_after_wake() -> str:
+    """
+    TTS «Слушаю» + continuous VAD параллельно.
+    Микрофон открывается сразу — начало длинной команды не теряется.
+    """
+    audio_box: list[np.ndarray] = []
+    err_box: list[Exception] = []
+
+    def _record_worker() -> None:
+        try:
+            audio_box.append(record_continuous(lead_in_sec=config.VAD_TTS_OVERLAP_SEC))
+        except Exception as exc:
+            err_box.append(exc)
+
+    rec = threading.Thread(target=_record_worker, daemon=True, name="vad-parallel")
+    rec.start()
+    time.sleep(config.VAD_MIC_WARMUP_SEC)
+    speak(config.CONFIRM_WAKE)
+    rec.join(timeout=config.VAD_MAX_RECORD_SEC + 15.0)
+
+    if err_box:
+        logger.error("listen_after_wake record: %s", err_box[0])
+        return ""
+
+    if not audio_box:
+        logger.warning("listen_after_wake: no audio captured")
+        return ""
+
+    return transcribe(audio_box[0])
 
 
 def wait_for_wake_word() -> bool:
@@ -529,41 +669,58 @@ async def _edge_tts_save(text: str, path: Path) -> bool:
 
 
 def _run_async_safe(coro) -> Any:
-    """Запуск coroutine в отдельном потоке — обход конфликтов event loop."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result(timeout=90)
+        return pool.submit(asyncio.run, coro).result(timeout=config.TTS_EDGE_TIMEOUT_SEC)
 
 
 def _edge_tts_to_file(text: str, path: Path) -> bool:
     for attempt in range(config.TTS_EDGE_RETRIES):
         try:
             if _run_async_safe(_edge_tts_save(text, path)):
+                logger.debug("edge-tts OK attempt %d", attempt + 1)
                 return True
         except Exception as exc:
-            logger.warning("edge-tts attempt %d: %s", attempt + 1, exc)
-            time.sleep(0.4 * (attempt + 1))
+            logger.warning("edge-tts attempt %d/%d: %s", attempt + 1, config.TTS_EDGE_RETRIES, exc)
+            time.sleep(0.5 * (attempt + 1))
     return False
 
 
 def _sapi_speak(text: str) -> bool:
+    """SAPI fallback с поддержкой кириллицы через временный UTF-8 файл."""
     if not config.TTS_USE_SAPI_FALLBACK:
         return False
-    safe = text.replace("'", "''")
+
+    txt_path: Path | None = None
     try:
-        subprocess.run(
-            [
-                "powershell", "-NoProfile", "-Command",
-                f"Add-Type -AssemblyName System.Speech; "
-                f"(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{safe}')",
-            ],
-            check=True,
-            capture_output=True,
-            timeout=90,
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8", dir=config.TEMP_DIR
+        ) as f:
+            f.write(text)
+            txt_path = Path(f.name)
+
+        rate = config.TTS_SAPI_RATE
+        ps = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"$s.Rate = {rate}; "
+            f"$t = Get-Content -LiteralPath '{txt_path}' -Encoding UTF8 -Raw; "
+            "$s.Speak($t);"
         )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            check=True, capture_output=True, timeout=120,
+        )
+        logger.info("TTS via SAPI (Unicode)")
         return True
     except Exception as exc:
         logger.warning("SAPI TTS failed: %s", exc)
         return False
+    finally:
+        if txt_path and txt_path.exists():
+            try:
+                txt_path.unlink()
+            except OSError:
+                pass
 
 
 def _play_mp3(path: Path) -> bool:
@@ -572,7 +729,13 @@ def _play_mp3(path: Path) -> bool:
         playsound(str(path), block=True)
         return True
     except Exception as exc:
-        logger.warning("playsound failed: %s", exc)
+        logger.warning("playsound failed: %s — trying winsound", exc)
+    try:
+        import winsound
+        winsound.PlaySound(str(path), winsound.SND_FILENAME)
+        return True
+    except Exception as exc:
+        logger.warning("winsound failed: %s", exc)
         return False
 
 
@@ -580,7 +743,7 @@ def speak(text: str) -> None:
     if not text or not text.strip():
         return
     text = text.strip()
-    logger.info("TTS: %r", text)
+    logger.info("TTS: %r", text[:80])
     tmp: Optional[Path] = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, dir=config.TEMP_DIR) as f:
@@ -590,7 +753,7 @@ def speak(text: str) -> None:
         logger.info("TTS fallback → SAPI")
         if _sapi_speak(text):
             return
-        logger.error("TTS: all methods failed")
+        logger.error("TTS: all methods failed for %r", text[:60])
     except Exception as exc:
         logger.error("TTS error: %s", exc)
         _sapi_speak(text)
@@ -603,7 +766,6 @@ def speak(text: str) -> None:
 
 
 def synthesize_to_file(text: str, path: Path) -> bool:
-    """Синтез речи в файл (для telegram_send_voice)."""
     return _edge_tts_to_file(text, path)
 
 
@@ -615,6 +777,9 @@ class VoiceEngine:
 
     def listen_command(self) -> str:
         return listen_command()
+
+    def listen_after_wake(self) -> str:
+        return listen_after_wake()
 
     def speak(self, text: str) -> None:
         speak(text)
