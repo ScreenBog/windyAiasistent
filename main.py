@@ -131,6 +131,8 @@ class WindyAssistant:
 
     def reload_settings(self) -> None:
         config.reload_settings()
+        config.ensure_app_paths()
+        config.invalidate_app_cache()
         self.voice.reload()
         self.brain.reload_prompt()
         setup_logging()
@@ -182,7 +184,11 @@ class WindyAssistant:
         tool_results: list[str] = []
         if response.has_actions:
             self._set_status("выполняю...")
-            tool_results = self.tools.execute_all(response.actions)
+            try:
+                tool_results = self.tools.execute_all(response.actions)
+            except Exception as exc:
+                logger.error("tools.execute_all: %s", exc, exc_info=True)
+                tool_results = [config.ERROR_GENERIC]
             for r in tool_results:
                 logger.info("tool result: %s", r[:200])
 

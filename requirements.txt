@@ -12,3 +12,4 @@ cryptg
 customtkinter
 darkdetect
 ctranslate2
+# edge-tts требует сеть; при сбое используется SAPI (Windows)

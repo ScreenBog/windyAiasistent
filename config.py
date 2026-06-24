@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -120,6 +121,138 @@ WHISPER_BEST_OF = 3
 WHISPER_NO_SPEECH_THRESHOLD = 0.45
 WHISPER_COMPRESSION_RATIO_THRESHOLD = 2.4
 WHISPER_LOG_PROB_THRESHOLD = -1.0
+TTS_EDGE_RETRIES = 3
+
+# Русские/разговорные имена → alias в APP_PATHS
+APP_ALIASES: dict[str, str] = {
+    "телеграм": "telegram",
+    "телеграмм": "telegram",
+    "телега": "telegram",
+    "хром": "chrome",
+    "гугл хром": "chrome",
+    "google chrome": "chrome",
+    "гугол хром": "chrome",
+    "дискорд": "discord",
+    "стим": "steam",
+    "блокнот": "notepad",
+    "калькулятор": "calc",
+    "проводник": "explorer",
+    "эдж": "edge",
+    "microsoft edge": "edge",
+    "спотифай": "spotify",
+    "vscode": "code",
+    "vs code": "code",
+    "вс код": "code",
+}
+
+# Дефолтные пути (если settings.json пуст)
+DEFAULT_APP_PATHS: dict[str, str] = {
+    "chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    "telegram": os.path.expandvars(r"%APPDATA%\Telegram Desktop\Telegram.exe"),
+    "discord": os.path.expandvars(r"%LOCALAPPDATA%\Discord\Update.exe --processStart Discord.exe"),
+    "steam": r"C:\Program Files (x86)\Steam\steam.exe",
+    "notepad": "notepad.exe",
+    "explorer": "explorer.exe",
+    "calc": "calc.exe",
+}
+
+_scanned_cache: dict[str, str] | None = None
+
+
+def normalize_app_name(name: str) -> str:
+    """Нормализация имени приложения (русский → alias)."""
+    import re
+    n = (name or "").strip().lower()
+    n = re.sub(r"[^\w\sа-яё\-]", " ", n, flags=re.I)
+    n = re.sub(r"\s+", " ", n).strip()
+    for prefix in ("открой", "запусти", "включи", "open", "start"):
+        if n.startswith(prefix + " "):
+            n = n[len(prefix) + 1 :].strip()
+    return APP_ALIASES.get(n, n)
+
+
+def _get_scanned_apps() -> dict[str, str]:
+    global _scanned_cache
+    if _scanned_cache is None:
+        try:
+            import app_scanner
+            _scanned_cache = app_scanner.scan_installed_apps(include_start_menu=False)
+        except Exception as exc:
+            logger.warning("app scan cache failed: %s", exc)
+            _scanned_cache = {}
+    return _scanned_cache
+
+
+def invalidate_app_cache() -> None:
+    global _scanned_cache
+    _scanned_cache = None
+
+
+def resolve_app_path(name: str) -> tuple[str | None, str]:
+    """
+    Найти путь к приложению.
+    Порядок: APP_PATHS → partial match → auto-scan → DEFAULT_APP_PATHS.
+    Возвращает (path, canonical_key).
+    """
+    key = normalize_app_name(name)
+    if not key:
+        return None, ""
+
+    if key in APP_PATHS and APP_PATHS[key]:
+        p = APP_PATHS[key]
+        if _path_exists(p):
+            return p, key
+
+    for k, v in APP_PATHS.items():
+        if key in k or k in key:
+            if _path_exists(v):
+                return v, k
+
+    scanned = _get_scanned_apps()
+    if key in scanned and _path_exists(scanned[key]):
+        return scanned[key], key
+    for k, v in scanned.items():
+        if key in k or k in key:
+            if _path_exists(v):
+                return v, k
+
+    if key in DEFAULT_APP_PATHS:
+        p = DEFAULT_APP_PATHS[key]
+        if _path_exists(p):
+            logger.info("app %s from defaults: %s", key, p)
+            return p, key
+
+    return None, key
+
+
+def _path_exists(spec: str) -> bool:
+    spec = (spec or "").strip()
+    if not spec:
+        return False
+    exe = spec.split(" --")[0].strip()
+    if Path(exe).exists():
+        return True
+    # notepad.exe, calc.exe — в PATH
+    if exe.endswith(".exe") and "/" not in exe and "\\" not in exe:
+        return True
+    return False
+
+
+def ensure_app_paths() -> None:
+    """Заполнить APP_PATHS из скана, если settings пуст."""
+    global APP_PATHS
+    if APP_PATHS:
+        return
+    try:
+        import app_scanner
+        found = app_scanner.scan_installed_apps(include_start_menu=False)
+        for k in ("chrome", "telegram", "discord", "steam", "notepad", "calc"):
+            if k in found:
+                APP_PATHS[k] = found[k]
+        if APP_PATHS:
+            logger.info("auto-filled %d apps", len(APP_PATHS))
+    except Exception as exc:
+        logger.warning("ensure_app_paths: %s", exc)
 
 
 def vad_sensitivity_scale() -> tuple[float, float, float]:
@@ -325,7 +458,9 @@ def set_app_paths(enabled: dict[str, str], manual: dict[str, str] | None = None)
     APP_PATHS = {k.lower(): v for k, v in enabled.items()}
     if manual is not None:
         APP_PATHS_MANUAL = {k.lower(): v for k, v in manual.items()}
+    invalidate_app_cache()
     save_settings()
 
 
 load_settings()
+ensure_app_paths()

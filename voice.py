@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import re
 import subprocess
@@ -19,7 +20,7 @@ import time
 from collections import deque
 from enum import Enum, auto
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import sounddevice as sd
@@ -303,7 +304,7 @@ class ContinuousVAD:
 
         if not self.started:
             self.wait_t += self.dt
-            self.pre_roll.append(data)
+            self.pre_roll.append(data)  # pre-roll: сохраняем аудио до детекта речи
             if level >= self.thr_on:
                 self.started = True
                 self.phase = VADPhase.RECORDING
@@ -408,29 +409,54 @@ def _clean_text(text: str) -> str:
     return " ".join(words)
 
 
+def _transcribe_once(audio: np.ndarray, *, vad_filter: bool) -> str:
+    segments, info = _get_whisper().transcribe(
+        audio,
+        language=config.WHISPER_LANGUAGE,
+        beam_size=config.WHISPER_BEAM_SIZE,
+        best_of=config.WHISPER_BEST_OF,
+        vad_filter=vad_filter,
+        vad_parameters={"min_silence_duration_ms": 350, "speech_pad_ms": 450},
+        no_speech_threshold=min(config.WHISPER_NO_SPEECH_THRESHOLD, 0.55),
+        condition_on_previous_text=False,
+        temperature=0.0,
+    )
+    text = _clean_text(" ".join(s.text.strip() for s in segments))
+    dur = getattr(info, "duration", 0) or 0
+    logger.info("STT [%.1fs vad=%s]: %r", dur, vad_filter, text)
+    return text
+
+
 def transcribe(audio: np.ndarray) -> str:
-    if audio is None or audio.size < config.SAMPLE_RATE * 0.2:
-        return ""
-    audio = _normalize(_highpass(audio))
-    if _rms(audio) < config.VAD_SILENCE_THRESHOLD * 0.15:
+    if audio is None or audio.size < int(config.SAMPLE_RATE * 0.15):
+        logger.debug("STT: audio too short")
         return ""
 
+    audio = _normalize(_highpass(audio))
+    rms = _rms(audio)
+    if rms < config.VAD_SILENCE_THRESHOLD * 0.08:
+        logger.debug("STT: audio too quiet rms=%.5f", rms)
+        return ""
+
+    # Padding — Whisper лучше распознаёт с небольшими паузами по краям
+    pad = int(config.SAMPLE_RATE * 0.25)
+    audio_padded = np.pad(audio, (pad, pad), mode="constant")
+
     try:
-        segments, info = _get_whisper().transcribe(
-            audio,
-            language=config.WHISPER_LANGUAGE,
-            beam_size=config.WHISPER_BEAM_SIZE,
-            best_of=config.WHISPER_BEST_OF,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 400, "speech_pad_ms": 400},
-            no_speech_threshold=config.WHISPER_NO_SPEECH_THRESHOLD,
-            condition_on_previous_text=False,
-            temperature=0.0,
-        )
-        text = _clean_text(" ".join(s.text.strip() for s in segments))
-        dur = getattr(info, "duration", 0) or 0
-        logger.info("STT [%.1fs]: %r", dur, text)
-        return text
+        for attempt, (data, use_vad) in enumerate([
+            (audio_padded, True),
+            (audio_padded, False),
+            (audio, False),
+        ]):
+            try:
+                text = _transcribe_once(data, vad_filter=use_vad)
+                if text:
+                    return text
+                logger.warning("STT empty attempt %d (vad=%s)", attempt, use_vad)
+            except Exception as exc:
+                logger.warning("STT attempt %d failed: %s", attempt, exc)
+                reset_whisper_model()
+        return ""
     except Exception as exc:
         logger.error("STT error: %s", exc)
         reset_whisper_model()
@@ -493,16 +519,29 @@ def wait_for_wake_word() -> bool:
 # ── TTS ───────────────────────────────────────────────────────────────────────
 
 async def _edge_tts_save(text: str, path: Path) -> bool:
-    try:
-        import edge_tts
-        comm = edge_tts.Communicate(
-            text, voice=config.TTS_VOICE, rate=config.TTS_RATE, volume=config.TTS_VOLUME
-        )
-        await comm.save(str(path))
-        return path.exists() and path.stat().st_size > 0
-    except Exception as exc:
-        logger.warning("edge-tts failed: %s", exc)
-        return False
+    import edge_tts
+    comm = edge_tts.Communicate(
+        text, voice=config.TTS_VOICE, rate=config.TTS_RATE, volume=config.TTS_VOLUME
+    )
+    await comm.save(str(path))
+    return path.exists() and path.stat().st_size > 512
+
+
+def _run_async_safe(coro) -> Any:
+    """Запуск coroutine в отдельном потоке — обход конфликтов event loop."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result(timeout=90)
+
+
+def _edge_tts_to_file(text: str, path: Path) -> bool:
+    for attempt in range(config.TTS_EDGE_RETRIES):
+        try:
+            if _run_async_safe(_edge_tts_save(text, path)):
+                return True
+        except Exception as exc:
+            logger.warning("edge-tts attempt %d: %s", attempt + 1, exc)
+            time.sleep(0.4 * (attempt + 1))
+    return False
 
 
 def _sapi_speak(text: str) -> bool:
@@ -526,6 +565,16 @@ def _sapi_speak(text: str) -> bool:
         return False
 
 
+def _play_mp3(path: Path) -> bool:
+    try:
+        from playsound3 import playsound
+        playsound(str(path), block=True)
+        return True
+    except Exception as exc:
+        logger.warning("playsound failed: %s", exc)
+        return False
+
+
 def speak(text: str) -> None:
     if not text or not text.strip():
         return
@@ -535,11 +584,12 @@ def speak(text: str) -> None:
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, dir=config.TEMP_DIR) as f:
             tmp = Path(f.name)
-        if asyncio.run(_edge_tts_save(text, tmp)):
-            from playsound3 import playsound
-            playsound(str(tmp), block=True)
+        if _edge_tts_to_file(text, tmp) and _play_mp3(tmp):
             return
-        _sapi_speak(text)
+        logger.info("TTS fallback → SAPI")
+        if _sapi_speak(text):
+            return
+        logger.error("TTS: all methods failed")
     except Exception as exc:
         logger.error("TTS error: %s", exc)
         _sapi_speak(text)
@@ -553,11 +603,7 @@ def speak(text: str) -> None:
 
 def synthesize_to_file(text: str, path: Path) -> bool:
     """Синтез речи в файл (для telegram_send_voice)."""
-    try:
-        return asyncio.run(_edge_tts_save(text, path))
-    except Exception as exc:
-        logger.error("synthesize_to_file: %s", exc)
-        return False
+    return _edge_tts_to_file(text, path)
 
 
 # ── Публичный API ─────────────────────────────────────────────────────────────

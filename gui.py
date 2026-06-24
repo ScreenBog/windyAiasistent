@@ -373,6 +373,7 @@ class WindyGUI(ctk.CTk):
         btn_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
         ctk.CTkButton(btn_row, text="Выбрать все", width=110, height=28, fg_color=Theme.SURFACE2, command=self._select_all_apps).pack(side="left", padx=2)
         ctk.CTkButton(btn_row, text="Снять все", width=110, height=28, fg_color=Theme.SURFACE2, command=self._deselect_all_apps).pack(side="left", padx=2)
+        ctk.CTkButton(btn_row, text="▶ Тест запуска", width=120, height=28, fg_color=Theme.SURFACE2, command=self._test_launch_app).pack(side="left", padx=2)
         ctk.CTkButton(btn_row, text="💾 Сохранить приложения", height=28, fg_color=Theme.ACCENT, command=self._save_apps).pack(side="right", padx=2)
 
     # ── Apps management ───────────────────────────────────────────────────────
@@ -380,6 +381,7 @@ class WindyGUI(ctk.CTk):
     def _scan_apps_async(self, *, initial: bool = False) -> None:
         def _work():
             try:
+                config.invalidate_app_cache()
                 scanned = app_scanner.scan_installed_apps()
                 merged = app_scanner.merge_with_manual(scanned, config.APP_PATHS_MANUAL)
                 self.after(0, lambda: self._populate_apps(merged, initial=initial))
@@ -421,9 +423,27 @@ class WindyGUI(ctk.CTk):
     def _get_enabled_apps(self) -> dict[str, str]:
         enabled: dict[str, str] = {}
         for name, cb in self._app_checks.items():
-            if cb.get() == 1:
-                enabled[name] = self._scanned_apps.get(name, config.APP_PATHS.get(name, ""))
+            try:
+                checked = cb.get() == 1
+            except Exception:
+                checked = bool(cb.cget("variable"))  # fallback
+            if checked:
+                path = self._scanned_apps.get(name) or config.APP_PATHS.get(name, "")
+                if path:
+                    enabled[name] = path
         return enabled
+
+    def _test_launch_app(self) -> None:
+        """Тест запуска первого отмеченного приложения."""
+        enabled = self._get_enabled_apps()
+        if not enabled:
+            messagebox.showwarning("", "Отметь хотя бы одно приложение")
+            return
+        name = next(iter(enabled))
+        def _w():
+            r = self.assistant.tools.execute("open_app", {"name": name})
+            self.after(0, lambda: messagebox.showinfo("Тест", r))
+        threading.Thread(target=_w, daemon=True).start()
 
     def _save_apps(self) -> None:
         enabled = self._get_enabled_apps()
@@ -487,13 +507,16 @@ class WindyGUI(ctk.CTk):
         sel = self.cmb_quick_app.get()
         if sel == "—":
             return
-        # Извлекаем alias из "(name)"
         if "(" in sel and ")" in sel:
             alias = sel.rsplit("(", 1)[1].rstrip(")")
         else:
             alias = sel
-        r = self.assistant.tools.execute("open_app", {"name": alias})
-        self._append_log(f"[quick] {r}")
+
+        def _w():
+            r = self.assistant.tools.execute("open_app", {"name": alias})
+            self._append_log(f"[quick] {alias}: {r}")
+
+        threading.Thread(target=_w, daemon=True).start()
 
     # ── Animation & health (from v5) ──────────────────────────────────────────
 

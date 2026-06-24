@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import subprocess
 import tempfile
 import time
@@ -237,29 +238,88 @@ def _tool_list_apps(params: dict[str, Any]) -> str:
     return " | ".join(lines[:15])
 
 
-def _tool_open_app(params: dict[str, Any]) -> str:
-    name = str(params.get("name") or params.get("app") or "").strip().lower()
-    path = params.get("path")
-    if path:
-        p = Path(str(path))
-        if not p.exists():
-            return f"Не найден: {p}"
-        os.startfile(str(p))  # type: ignore[attr-defined]
-        return f"Открываю {p.name}"
-    if not name:
-        return "Приложение не указано. Доступны: " + ", ".join(sorted(config.APP_PATHS)[:12])
-    app = config.APP_PATHS.get(name)
+def _parse_launch_spec(spec: str) -> list[str]:
+    """Разбор 'C:\\path\\app.exe --arg value' в argv для subprocess."""
+    spec = spec.strip()
+    if not spec:
+        return []
     try:
-        if not app:
-            subprocess.Popen(name, shell=True)
-            return f"Запуск {name}"
-        if " --" in app:
-            subprocess.Popen(app, shell=True)
-        else:
-            os.startfile(app)  # type: ignore[attr-defined]
-        return f"Открываю {name}"
+        return shlex.split(spec, posix=False)
+    except ValueError:
+        if " --" in spec:
+            exe, rest = spec.split(" --", 1)
+            return [exe.strip(), "--" + rest.strip()]
+        return [spec]
+
+
+def _launch_executable(spec: str) -> tuple[bool, str]:
+    """
+    Запуск приложения Windows. Возвращает (успех, детали).
+    Поддерживает: полный путь, notepad.exe, discord Update.exe --processStart.
+    """
+    argv = _parse_launch_spec(spec)
+    if not argv:
+        return False, "путь пуст"
+
+    exe = argv[0]
+    exe_path = Path(exe)
+
+    # Системные команды в PATH (notepad.exe, calc.exe)
+    if not exe_path.is_absolute() and "\\" not in exe and "/" not in exe:
+        try:
+            proc = subprocess.Popen(argv, shell=False)
+            logger.info("launched PATH app %s pid=%s", exe, proc.pid)
+            return True, f"PID {proc.pid}"
+        except FileNotFoundError:
+            pass
+
+    if not exe_path.exists():
+        return False, f"файл не найден: {exe}"
+
+    try:
+        cwd = str(exe_path.parent) if exe_path.parent.exists() else None
+        proc = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            shell=False,
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) or 0,
+        )
+        logger.info("launched %s pid=%s args=%s", exe, proc.pid, argv[1:])
+        return True, f"PID {proc.pid}"
     except Exception as exc:
-        return f"Ошибка: {exc}"
+        logger.warning("Popen failed %s: %s — trying shell", spec, exc)
+        try:
+            subprocess.Popen(spec, shell=True)
+            return True, "shell"
+        except Exception as exc2:
+            logger.error("launch failed %s: %s", spec, exc2)
+            return False, str(exc2)
+
+
+def _tool_open_app(params: dict[str, Any]) -> str:
+    raw_name = str(params.get("name") or params.get("app") or "").strip()
+    path = params.get("path")
+
+    if path:
+        ok, detail = _launch_executable(str(path))
+        return f"Открываю {Path(str(path)).name}" if ok else f"Не удалось: {detail}"
+
+    if not raw_name:
+        apps = ", ".join(sorted(config.APP_PATHS)[:12]) or "настрой в GUI"
+        return f"Приложение не указано. Доступны: {apps}"
+
+    app_path, key = config.resolve_app_path(raw_name)
+    if not app_path:
+        logger.warning("app not found: %r (normalized=%s)", raw_name, config.normalize_app_name(raw_name))
+        return (
+            f"Приложение «{raw_name}» не найдено. "
+            f"Добавь в GUI → Приложения. Известны: {', '.join(sorted(config.APP_PATHS)[:8])}"
+        )
+
+    ok, detail = _launch_executable(app_path)
+    if ok:
+        return f"Запущено: {key} ({detail})"
+    return f"Ошибка запуска {key}: {detail}"
 
 
 def _tool_launch_game(params: dict[str, Any]) -> str:
@@ -380,6 +440,27 @@ def _register() -> None:
 _register()
 
 
+def _parse_action(action: Any) -> tuple[str, dict[str, Any]]:
+    """
+    Универсальный парсер action: brain.Action dataclass или dict.
+    Исправляет AttributeError: Action has no attribute 'get'.
+    """
+    if isinstance(action, dict):
+        tool = str(action.get("tool") or action.get("name") or "").strip().lower()
+        params = action.get("params") or action.get("arguments") or {}
+    else:
+        tool = str(getattr(action, "tool", None) or getattr(action, "name", None) or "").strip().lower()
+        params = getattr(action, "params", None)
+        if params is None:
+            params = getattr(action, "arguments", None)
+        if params is None:
+            params = {}
+
+    if not isinstance(params, dict):
+        params = {"value": params}
+    return tool, params
+
+
 class ToolExecutor:
     def __init__(self, registry: dict[str, ToolHandler] | None = None) -> None:
         self.registry = registry or TOOL_REGISTRY
@@ -393,10 +474,17 @@ class ToolExecutor:
 
     def execute_all(self, actions: list) -> list[str]:
         results: list[str] = []
-        for action in actions:
-            tool = getattr(action, "tool", None) or action.get("tool", "")
-            params = getattr(action, "params", None) or action.get("params", {})
-            results.append(self.execute(tool, params))
+        for i, action in enumerate(actions):
+            try:
+                tool, params = _parse_action(action)
+                if not tool:
+                    results.append(f"action[{i}]: пустой tool")
+                    continue
+                logger.info("execute tool=%s params=%s", tool, params)
+                results.append(self.execute(tool, params))
+            except Exception as exc:
+                logger.error("execute_all[%d]: %s", i, exc, exc_info=True)
+                results.append(f"Ошибка action[{i}]: {exc}")
         return results
 
     def list_tools(self) -> list[str]:
