@@ -120,9 +120,11 @@ WHISPER_COMPUTE_TYPE = "int8"
 WHISPER_LANGUAGE = "ru"
 OLLAMA_HOST = "http://127.0.0.1:11434"
 OLLAMA_MODEL = "qwen2.5:3b-windy"
-OLLAMA_MODEL_FAST = ""              # пусто = OLLAMA_MODEL (быстрые команды)
-OLLAMA_MODEL_SLOW = ""              # пусто = OLLAMA_MODEL (сложные сценарии)
-HYBRID_MODELS_ENABLED = True
+OLLAMA_MODEL_FAST = "windy-fast"    # Qwen2.5-1.5B — простые команды
+OLLAMA_MODEL_SLOW = "qwen2.5:3b-windy"  # цепочки, Telegram, контекст
+HYBRID_MODELS_ENABLED = True        # alias в settings: hybrid_enabled
+HYBRID_FAST_MAX_MACROS = 2          # fast-модель: не больше N шагов
+HYBRID_FORCE_SLOW_ON_COMPLEX = True # сложные сразу на slow (не тратить fast)
 SIMPLE_COMMAND_MAX_WORDS = 6
 LEARNING_ENABLED = True
 LEARNING_AUTO_SCAN = True
@@ -155,7 +157,7 @@ PLUGINS_ENABLED = True
 GUI_THEME = "dark"
 GUI_ACCENT = "#6366f1"
 GUI_ACCENT_HOVER = "#4f46e5"
-GUI_VERSION = "v10.0"
+GUI_VERSION = "v10.1"
 GUI_SUCCESS = "#22c55e"
 GUI_WARNING = "#f59e0b"
 GUI_DANGER = "#ef4444"
@@ -467,13 +469,28 @@ def is_shell_command_allowed(command: str) -> tuple[bool, str]:
     return True, ""
 
 
+def is_hybrid_enabled() -> bool:
+    """Гибрид fast/slow включён."""
+    return bool(HYBRID_MODELS_ENABLED)
+
+
+def get_ollama_model_fast() -> str:
+    """Быстрая модель (windy-fast)."""
+    return (OLLAMA_MODEL_FAST or OLLAMA_MODEL).strip()
+
+
+def get_ollama_model_slow() -> str:
+    """Медленная модель (3b/7b)."""
+    return (OLLAMA_MODEL_SLOW or OLLAMA_MODEL).strip()
+
+
 def resolve_ollama_model(*, complex_task: bool) -> str:
     """Гибрид: быстрая модель для простых команд, медленная для сложных."""
-    if not HYBRID_MODELS_ENABLED:
+    if not is_hybrid_enabled():
         return OLLAMA_MODEL
     if complex_task:
-        return OLLAMA_MODEL_SLOW or OLLAMA_MODEL
-    return OLLAMA_MODEL_FAST or OLLAMA_MODEL
+        return get_ollama_model_slow()
+    return get_ollama_model_fast()
 
 
 def is_ambiguous_app_site(name: str) -> bool:
@@ -708,7 +725,8 @@ def _apply_dict(data: dict[str, Any]) -> None:
     global WHISPER_COMPUTE_TYPE, WHISPER_LANGUAGE, OLLAMA_HOST, OLLAMA_MODEL
     global OLLAMA_TEMPERATURE, OLLAMA_NUM_CTX, OLLAMA_NUM_GPU, OLLAMA_TOP_P
     global OLLAMA_REPEAT_PENALTY, OLLAMA_MODEL_FAST, OLLAMA_MODEL_SLOW
-    global HYBRID_MODELS_ENABLED, SIMPLE_COMMAND_MAX_WORDS
+    global HYBRID_MODELS_ENABLED, HYBRID_FAST_MAX_MACROS, HYBRID_FORCE_SLOW_ON_COMPLEX
+    global SIMPLE_COMMAND_MAX_WORDS
     global LEARNING_ENABLED, LEARNING_AUTO_SCAN, LEARNING_MAX_ENTRIES, LEARNING_MAX_CORRECTIONS
     global TTS_VOICE, TTS_RATE, TTS_VOLUME
     global VAD_SENSITIVITY, VAD_SPEECH_THRESHOLD, VAD_SILENCE_THRESHOLD
@@ -765,9 +783,16 @@ def _apply_dict(data: dict[str, Any]) -> None:
     WHISPER_LANGUAGE = str(data.get("whisper_language", WHISPER_LANGUAGE))
     OLLAMA_HOST = str(data.get("ollama_host", OLLAMA_HOST))
     OLLAMA_MODEL = str(data.get("ollama_model", OLLAMA_MODEL))
-    OLLAMA_MODEL_FAST = str(data.get("ollama_model_fast", OLLAMA_MODEL_FAST))
-    OLLAMA_MODEL_SLOW = str(data.get("ollama_model_slow", OLLAMA_MODEL_SLOW))
-    HYBRID_MODELS_ENABLED = bool(data.get("hybrid_models_enabled", HYBRID_MODELS_ENABLED))
+    OLLAMA_MODEL_FAST = str(data.get("ollama_model_fast", OLLAMA_MODEL_FAST) or "windy-fast")
+    OLLAMA_MODEL_SLOW = str(data.get("ollama_model_slow", OLLAMA_MODEL_SLOW) or OLLAMA_MODEL)
+    if "hybrid_enabled" in data:
+        HYBRID_MODELS_ENABLED = bool(data.get("hybrid_enabled"))
+    else:
+        HYBRID_MODELS_ENABLED = bool(data.get("hybrid_models_enabled", HYBRID_MODELS_ENABLED))
+    HYBRID_FAST_MAX_MACROS = int(data.get("hybrid_fast_max_macros", HYBRID_FAST_MAX_MACROS) or 2)
+    HYBRID_FORCE_SLOW_ON_COMPLEX = bool(
+        data.get("hybrid_force_slow_on_complex", HYBRID_FORCE_SLOW_ON_COMPLEX)
+    )
     SIMPLE_COMMAND_MAX_WORDS = int(data.get("simple_command_max_words", SIMPLE_COMMAND_MAX_WORDS) or 6)
     LEARNING_ENABLED = bool(data.get("learning_enabled", LEARNING_ENABLED))
     LEARNING_AUTO_SCAN = bool(data.get("learning_auto_scan", LEARNING_AUTO_SCAN))
@@ -873,6 +898,9 @@ def to_dict() -> dict[str, Any]:
         "ollama_model_fast": OLLAMA_MODEL_FAST,
         "ollama_model_slow": OLLAMA_MODEL_SLOW,
         "hybrid_models_enabled": HYBRID_MODELS_ENABLED,
+        "hybrid_enabled": HYBRID_MODELS_ENABLED,
+        "hybrid_fast_max_macros": HYBRID_FAST_MAX_MACROS,
+        "hybrid_force_slow_on_complex": HYBRID_FORCE_SLOW_ON_COMPLEX,
         "simple_command_max_words": SIMPLE_COMMAND_MAX_WORDS,
         "learning_enabled": LEARNING_ENABLED,
         "learning_auto_scan": LEARNING_AUTO_SCAN,

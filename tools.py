@@ -953,8 +953,17 @@ class ToolExecutor:
     def execute_macros(self, macros: list) -> list[str]:
         return self.macros.execute_all(macros)
 
-    def execute_response(self, *, macros: list | None = None, actions: list | None = None) -> list[str]:
+    def execute_response(
+        self,
+        *,
+        macros: list | None = None,
+        actions: list | None = None,
+        model_used: str = "",
+        route_tier: str = "",
+    ) -> list[str]:
         """Приоритет: macros → legacy actions."""
+        if model_used or route_tier:
+            logger.info("execute macros: tier=%s model=%s count=%d", route_tier, model_used, len(macros or []))
         if macros:
             return self.execute_macros(macros)
         if actions:

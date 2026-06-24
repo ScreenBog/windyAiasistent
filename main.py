@@ -122,6 +122,11 @@ class WindyAssistant:
     def get_service_health(self) -> dict[str, tuple[bool, str]]:
         """Статусы сервисов для GUI."""
         ollama_ok = self.brain.check_connection()
+        hs = self.brain.get_hybrid_status()
+        ollama_lbl = (
+            f"{hs.get('fast', '?')} / {hs.get('slow', '?')}"
+            if hs.get("hybrid_enabled") else config.OLLAMA_MODEL
+        )
         whisper_st = self.voice.get_whisper_status()
         whisper_ok = "ошибка" not in whisper_st.lower()
         try:
@@ -130,7 +135,7 @@ class WindyAssistant:
         except Exception as exc:
             tg_ok, tg_msg = False, str(exc)[:50]
         return {
-            "ollama": (ollama_ok, "OK" if ollama_ok else "offline"),
+            "ollama": (ollama_ok, ollama_lbl if ollama_ok else "offline"),
             "whisper": (whisper_ok, whisper_st),
             "telegram": (tg_ok, tg_msg),
         }
@@ -152,14 +157,15 @@ class WindyAssistant:
     def startup(self, speak: bool = True) -> None:
         from voice import get_voice_backends
         vb = get_voice_backends()
+        hs = self.brain.get_hybrid_status()
         logger.info(
-            "Windy v%s | voice idle+hybrid-vad | webrtc=%s nr=%s | whisper=%s/%s | "
-            "ollama=%s | vad_release=%.1fs pre_roll=%.1fs",
+            "Windy v%s | hybrid=%s fast=%s slow=%s | whisper=%s/%s | vad_release=%.1fs",
             config.GUI_VERSION,
-            vb.get("webrtcvad"), vb.get("noisereduce"),
+            hs.get("hybrid_enabled"),
+            hs.get("fast"),
+            hs.get("slow"),
             config.WHISPER_MODEL, config.WHISPER_DEVICE,
-            config.OLLAMA_MODEL,
-            config.vad_release_sec(), config.VAD_PRE_ROLL_SEC,
+            config.vad_release_sec(),
         )
         if not self.brain.check_connection():
             logger.warning("Ollama unavailable — запусти ollama serve")
@@ -193,6 +199,11 @@ class WindyAssistant:
 
         try:
             response = self.brain.think(clean)
+            if response.route_tier:
+                logger.info(
+                    "model route: tier=%s model=%s reason=%s",
+                    response.route_tier, response.model_used, response.route_reason,
+                )
         except Exception as exc:
             logger.error("brain error: %s", exc, exc_info=True)
             if speak:
@@ -206,6 +217,8 @@ class WindyAssistant:
                 tool_results = self.tools.execute_response(
                     macros=response.macros_as_dicts() if response.macros else None,
                     actions=response.actions if response.actions and not response.macros else None,
+                    model_used=response.model_used,
+                    route_tier=response.route_tier,
                 )
             except Exception as exc:
                 logger.error("tools.execute_response: %s", exc, exc_info=True)
