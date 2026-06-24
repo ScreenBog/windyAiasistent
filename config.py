@@ -48,11 +48,32 @@ ERROR_GENERIC = "Произошла ошибка. Попробуй ещё раз
 NO_SPEECH = "Я тебя не расслышал."
 CONFIRM_WAKE = "Слушаю."
 
-# ── Wake-word polling ─────────────────────────────────────────────────────────
-WAKE_CHUNK_SEC = 3.0
-WAKE_POLL_INTERVAL = 0.2
+# ── Wake-word (low-power idle) ────────────────────────────────────────────────
+WAKE_CHUNK_SEC = 2.5                  # буфер для Whisper wake (после energy gate)
+WAKE_IDLE_CHUNK_MS = 280              # маленькие чанки в idle — низкая нагрузка
+WAKE_POLL_INTERVAL = 0.15
+WAKE_BACKEND = "hybrid"               # hybrid | whisper | openwakeword
+WAKE_ENERGY_GATE = True               # не гонять STT на тишине
+WAKE_MIN_ENERGY_MULT = 2.2            # порог = noise_floor × mult
+WAKE_SPEECH_REQUIRED = True           # WebRTC: речь должна быть в чанке
+WAKE_BUFFER_SEC = 2.2                 # накопление перед STT
+WAKE_CALIBRATION_SEC = 1.0            # калибровка фона в idle
+OPENWAKEWORD_ENABLED = False          # нужна своя модель под «Винди»
+OPENWAKEWORD_MODEL = ""               # путь к .onnx или имя из openwakeword
+OPENWAKEWORD_THRESHOLD = 0.55
 
-# ── VAD defaults (continuous listening) ─────────────────────────────────────
+# ── Шумоподавление + VAD backends ─────────────────────────────────────────────
+NOISE_REDUCE_ENABLED = True
+NOISE_REDUCE_STATIONARY = True
+NOISE_REDUCE_PROP = 0.82              # 0..1 сила подавления
+VAD_BACKEND = "hybrid"                # hybrid | rms | webrtc
+WEBRTC_VAD_AGGRESSIVENESS = 2         # 0=чувствительный … 3=агрессивный
+WEBRTC_SPEECH_RATIO_ON = 0.38         # доля speech-фреймов для «есть речь»
+SILERO_VAD_ENABLED = False            # опционально (torch)
+SILERO_VAD_THRESHOLD = 0.42
+END_OF_SPEECH_ENABLED = True          # release по тишине (умная колонка)
+
+# ── VAD defaults (continuous listening после wake) ────────────────────────────
 # Чувствительность 0.0–1.0: выше → легче начать запись, дольше ждёт паузу.
 VAD_SENSITIVITY = 0.60
 VAD_CHUNK_MS = 60                    # меньший чанк → точнее границы речи
@@ -134,7 +155,7 @@ PLUGINS_ENABLED = True
 GUI_THEME = "dark"
 GUI_ACCENT = "#6366f1"
 GUI_ACCENT_HOVER = "#4f46e5"
-GUI_VERSION = "v9.1"
+GUI_VERSION = "v10.0"
 GUI_SUCCESS = "#22c55e"
 GUI_WARNING = "#f59e0b"
 GUI_DANGER = "#ef4444"
@@ -340,6 +361,24 @@ _PRIORITY_APPS: tuple[str, ...] = (
 )
 
 _scanned_cache: dict[str, str] | None = None
+
+
+def ensure_wake_aliases() -> None:
+    """Дефолтные алиасы wake-word если settings пуст."""
+    global WAKE_WORD_ALIASES
+    if WAKE_WORD_ALIASES:
+        return
+    w = (WAKE_WORD or "винди").strip().lower()
+    WAKE_WORD_ALIASES = (
+        w,
+        f"эй {w}",
+        f"hey {w}",
+        "эй винди",
+        "hey винди",
+        "винди",
+        "windy",
+        "hey windy",
+    )
 
 
 def normalize_browser_query(query: str) -> str:
@@ -658,7 +697,14 @@ def resolve_whisper_backend() -> list[tuple[str, str]]:
 
 
 def _apply_dict(data: dict[str, Any]) -> None:
-    global WAKE_WORD, WAKE_WORD_ALIASES, WHISPER_MODEL, WHISPER_DEVICE
+    global WAKE_WORD, WAKE_WORD_ALIASES
+    global WAKE_CHUNK_SEC, WAKE_IDLE_CHUNK_MS, WAKE_POLL_INTERVAL, WAKE_BACKEND
+    global WAKE_ENERGY_GATE, WAKE_MIN_ENERGY_MULT, WAKE_SPEECH_REQUIRED, WAKE_BUFFER_SEC
+    global WAKE_CALIBRATION_SEC, OPENWAKEWORD_ENABLED, OPENWAKEWORD_MODEL, OPENWAKEWORD_THRESHOLD
+    global NOISE_REDUCE_ENABLED, NOISE_REDUCE_STATIONARY, NOISE_REDUCE_PROP
+    global VAD_BACKEND, WEBRTC_VAD_AGGRESSIVENESS, WEBRTC_SPEECH_RATIO_ON
+    global SILERO_VAD_ENABLED, SILERO_VAD_THRESHOLD, END_OF_SPEECH_ENABLED
+    global WHISPER_MODEL, WHISPER_DEVICE
     global WHISPER_COMPUTE_TYPE, WHISPER_LANGUAGE, OLLAMA_HOST, OLLAMA_MODEL
     global OLLAMA_TEMPERATURE, OLLAMA_NUM_CTX, OLLAMA_NUM_GPU, OLLAMA_TOP_P
     global OLLAMA_REPEAT_PENALTY, OLLAMA_MODEL_FAST, OLLAMA_MODEL_SLOW
@@ -682,6 +728,29 @@ def _apply_dict(data: dict[str, Any]) -> None:
 
     WAKE_WORD = str(data.get("wake_word", WAKE_WORD))
     WAKE_WORD_ALIASES = tuple(str(a).lower() for a in data.get("wake_word_aliases", WAKE_WORD_ALIASES))
+    ensure_wake_aliases()
+
+    WAKE_CHUNK_SEC = float(data.get("wake_chunk_sec", WAKE_CHUNK_SEC))
+    WAKE_IDLE_CHUNK_MS = int(data.get("wake_idle_chunk_ms", WAKE_IDLE_CHUNK_MS) or 280)
+    WAKE_POLL_INTERVAL = float(data.get("wake_poll_interval", WAKE_POLL_INTERVAL))
+    WAKE_BACKEND = str(data.get("wake_backend", WAKE_BACKEND))
+    WAKE_ENERGY_GATE = bool(data.get("wake_energy_gate", WAKE_ENERGY_GATE))
+    WAKE_MIN_ENERGY_MULT = float(data.get("wake_min_energy_mult", WAKE_MIN_ENERGY_MULT))
+    WAKE_SPEECH_REQUIRED = bool(data.get("wake_speech_required", WAKE_SPEECH_REQUIRED))
+    WAKE_BUFFER_SEC = float(data.get("wake_buffer_sec", WAKE_BUFFER_SEC))
+    WAKE_CALIBRATION_SEC = float(data.get("wake_calibration_sec", WAKE_CALIBRATION_SEC))
+    OPENWAKEWORD_ENABLED = bool(data.get("openwakeword_enabled", OPENWAKEWORD_ENABLED))
+    OPENWAKEWORD_MODEL = str(data.get("openwakeword_model", OPENWAKEWORD_MODEL))
+    OPENWAKEWORD_THRESHOLD = float(data.get("openwakeword_threshold", OPENWAKEWORD_THRESHOLD))
+    NOISE_REDUCE_ENABLED = bool(data.get("noise_reduce_enabled", NOISE_REDUCE_ENABLED))
+    NOISE_REDUCE_STATIONARY = bool(data.get("noise_reduce_stationary", NOISE_REDUCE_STATIONARY))
+    NOISE_REDUCE_PROP = float(data.get("noise_reduce_prop", NOISE_REDUCE_PROP))
+    VAD_BACKEND = str(data.get("vad_backend", VAD_BACKEND))
+    WEBRTC_VAD_AGGRESSIVENESS = int(data.get("webrtc_vad_aggressiveness", WEBRTC_VAD_AGGRESSIVENESS) or 2)
+    WEBRTC_SPEECH_RATIO_ON = float(data.get("webrtc_speech_ratio_on", WEBRTC_SPEECH_RATIO_ON))
+    SILERO_VAD_ENABLED = bool(data.get("silero_vad_enabled", SILERO_VAD_ENABLED))
+    SILERO_VAD_THRESHOLD = float(data.get("silero_vad_threshold", SILERO_VAD_THRESHOLD))
+    END_OF_SPEECH_ENABLED = bool(data.get("end_of_speech_enabled", END_OF_SPEECH_ENABLED))
 
     WHISPER_MODEL = str(data.get("whisper_model", WHISPER_MODEL))
     dev = str(data.get("whisper_device", WHISPER_DEVICE)).lower()
@@ -774,6 +843,27 @@ def to_dict() -> dict[str, Any]:
     return {
         "wake_word": WAKE_WORD,
         "wake_word_aliases": list(WAKE_WORD_ALIASES),
+        "wake_chunk_sec": WAKE_CHUNK_SEC,
+        "wake_idle_chunk_ms": WAKE_IDLE_CHUNK_MS,
+        "wake_poll_interval": WAKE_POLL_INTERVAL,
+        "wake_backend": WAKE_BACKEND,
+        "wake_energy_gate": WAKE_ENERGY_GATE,
+        "wake_min_energy_mult": WAKE_MIN_ENERGY_MULT,
+        "wake_speech_required": WAKE_SPEECH_REQUIRED,
+        "wake_buffer_sec": WAKE_BUFFER_SEC,
+        "wake_calibration_sec": WAKE_CALIBRATION_SEC,
+        "openwakeword_enabled": OPENWAKEWORD_ENABLED,
+        "openwakeword_model": OPENWAKEWORD_MODEL,
+        "openwakeword_threshold": OPENWAKEWORD_THRESHOLD,
+        "noise_reduce_enabled": NOISE_REDUCE_ENABLED,
+        "noise_reduce_stationary": NOISE_REDUCE_STATIONARY,
+        "noise_reduce_prop": NOISE_REDUCE_PROP,
+        "vad_backend": VAD_BACKEND,
+        "webrtc_vad_aggressiveness": WEBRTC_VAD_AGGRESSIVENESS,
+        "webrtc_speech_ratio_on": WEBRTC_SPEECH_RATIO_ON,
+        "silero_vad_enabled": SILERO_VAD_ENABLED,
+        "silero_vad_threshold": SILERO_VAD_THRESHOLD,
+        "end_of_speech_enabled": END_OF_SPEECH_ENABLED,
         "whisper_model": WHISPER_MODEL,
         "whisper_device": WHISPER_DEVICE,
         "whisper_compute_type": WHISPER_COMPUTE_TYPE,
@@ -875,4 +965,5 @@ def set_app_paths(enabled: dict[str, str], manual: dict[str, str] | None = None)
 
 
 load_settings()
+ensure_wake_aliases()
 ensure_app_paths()

@@ -1,5 +1,5 @@
 """
-Windy AI Assistant v9.1 — современный GUI (CustomTkinter).
+Windy AI Assistant v10.0 — современный GUI (CustomTkinter).
 
 Страницы:
   - Главная: wake-word, VAD, быстрая команда
@@ -52,6 +52,9 @@ class Theme:
 
 
 _VAD_LABELS = {
+    "idle": "Ожидание wake-word",
+    "wake": "Wake-word!",
+    "active": "Слушаю команду",
     "lead_in": "Микрофон (TTS)",
     "calibrating": "Калибровка",
     "waiting": "Ожидание речи",

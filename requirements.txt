@@ -1,12 +1,15 @@
 # Windy AI Assistant — зависимости
 # Python 3.10+
 
-# STT
+# STT + Voice (VAD, wake, noise reduction)
 faster-whisper
 ctranslate2
 sounddevice
 scipy
 numpy
+webrtcvad-wheels
+noisereduce
+openwakeword
 
 # TTS
 edge-tts

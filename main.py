@@ -150,13 +150,16 @@ class WindyAssistant:
         setup_logging()
 
     def startup(self, speak: bool = True) -> None:
+        from voice import get_voice_backends
+        vb = get_voice_backends()
         logger.info(
-            "Windy v%s | whisper=%s/%s | ollama=%s fast=%s slow=%s | hybrid=%s | apps=%d sites=%d",
+            "Windy v%s | voice idle+hybrid-vad | webrtc=%s nr=%s | whisper=%s/%s | "
+            "ollama=%s | vad_release=%.1fs pre_roll=%.1fs",
             config.GUI_VERSION,
+            vb.get("webrtcvad"), vb.get("noisereduce"),
             config.WHISPER_MODEL, config.WHISPER_DEVICE,
-            config.OLLAMA_MODEL, config.OLLAMA_MODEL_FAST or "-", config.OLLAMA_MODEL_SLOW or "-",
-            config.HYBRID_MODELS_ENABLED,
-            len(config.APP_PATHS), len(config.BROWSER_SITES),
+            config.OLLAMA_MODEL,
+            config.vad_release_sec(), config.VAD_PRE_ROLL_SEC,
         )
         if not self.brain.check_connection():
             logger.warning("Ollama unavailable — запусти ollama serve")

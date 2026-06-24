@@ -1,12 +1,15 @@
 """
-Голосовой модуль Windy AI Assistant.
+Голосовой модуль Windy AI Assistant v10 — архитектура «умной колонки».
 
-Возможности:
-  - Wake-word detection (faster-whisper)
-  - Continuous VAD v2: RMS + energy + peak, pre-roll, attack/release, hangover
-  - Параллельная запись во время TTS «Слушаю» — не теряется начало фразы
-  - TTS: edge-tts → SAPI (Unicode) → winsound
-  - Callbacks для GUI (уровень микрофона, статус VAD)
+Режимы:
+  IDLE (low-power)  — маленькие чанки, energy gate + WebRTC, STT только при речи
+  ACTIVE (post-wake)— полный hybrid VAD + end-of-speech + шумоподавление → Whisper
+
+Backends (опционально, с fallback):
+  - webrtcvad      — детекция речи в idle и active
+  - noisereduce    — спектральное шумоподавление
+  - openwakeword   — опциональный wake (нужна своя модель)
+  - Silero VAD     — опционально (torch)
 """
 
 from __future__ import annotations
@@ -33,19 +36,38 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# ── Глобальное состояние ──────────────────────────────────────────────────────
+# ── Опциональные backends ─────────────────────────────────────────────────────
+
+def _try_import(name: str):
+    try:
+        return __import__(name)
+    except ImportError:
+        return None
+
+
+_HAVE_WEBRTC = _try_import("webrtcvad") is not None
+_HAVE_NR = _try_import("noisereduce") is not None
+_HAVE_OWW = _try_import("openwakeword") is not None
+
 _whisper_model = None
 _whisper_key: tuple | None = None
 _on_wake: Callable[[], None] | None = None
 _on_mic_level: Callable[[float], None] | None = None
 _on_vad_state: Callable[[str], None] | None = None
 _force_wake = False
+_silero_model: Any = None
+_silero_utils: Any = None
+
 _FILLER = re.compile(r"\b(э+|мм+|ну+|ага|угу|типа|как бы)\b", re.IGNORECASE)
 
 
+class ListeningMode(Enum):
+    IDLE = "idle"       # low-power: только wake-word
+    ACTIVE = "active"   # полный VAD после wake
+
+
 class VADPhase(Enum):
-    """Фазы continuous listening."""
-    LEAD_IN = auto()       # микрофон открыт во время TTS
+    LEAD_IN = auto()
     CALIBRATING = auto()
     WAITING = auto()
     RECORDING = auto()
@@ -70,7 +92,6 @@ def set_vad_state_callback(cb: Callable[[str], None] | None) -> None:
 
 
 def trigger_force_wake() -> None:
-    """Принудительный wake без произнесения wake-word (кнопка GUI)."""
     global _force_wake
     _force_wake = True
 
@@ -86,6 +107,15 @@ def consume_force_wake() -> bool:
 def reset_whisper_model() -> None:
     global _whisper_model, _whisper_key
     _whisper_model = _whisper_key = None
+
+
+def get_voice_backends() -> dict[str, bool]:
+    return {
+        "webrtcvad": _HAVE_WEBRTC,
+        "noisereduce": _HAVE_NR,
+        "openwakeword": _HAVE_OWW,
+        "silero": config.SILERO_VAD_ENABLED,
+    }
 
 
 # ── Whisper ───────────────────────────────────────────────────────────────────
@@ -137,10 +167,6 @@ def _peak(audio: np.ndarray) -> float:
 
 
 def _voice_level(audio: np.ndarray) -> float:
-    """
-    Комбинированный уровень громкости: RMS + sqrt(energy) + peak.
-    Устойчив к фону, но чувствителен к тихим согласным и началу слов.
-    """
     r, e, p = _rms(audio), _energy(audio), _peak(audio)
     w_e = config.VAD_ENERGY_WEIGHT
     w_p = config.VAD_PEAK_WEIGHT
@@ -154,7 +180,6 @@ def _smooth(value: float, buf: deque[float]) -> float:
 
 
 def _highpass(audio: np.ndarray) -> np.ndarray:
-    """Фильтр НЧ-шума (~80 Hz)."""
     try:
         if audio.size < 64:
             return audio
@@ -173,10 +198,15 @@ def _normalize(audio: np.ndarray, target: float = 0.05) -> np.ndarray:
     return np.clip(audio * min(target / r, 10.0), -1.0, 1.0).astype(np.float32)
 
 
-def _emit_mic(level: float) -> None:
+def _to_pcm16(audio: np.ndarray) -> bytes:
+    return (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+
+
+def _emit_mic(level: float, *, idle: bool = False) -> None:
     if _on_mic_level:
         try:
-            _on_mic_level(min(1.0, level * 22.0))
+            scale = 14.0 if idle else 22.0
+            _on_mic_level(min(1.0, level * scale))
         except Exception:
             pass
 
@@ -200,51 +230,332 @@ def _sd_kwargs() -> dict:
     return kw
 
 
-def _record_fixed(sec: float, *, emit_levels: bool = False) -> np.ndarray:
-    """Фиксированная запись; при emit_levels — live-уровень для GUI."""
-    n = int(sec * config.SAMPLE_RATE)
-    if n <= 0:
-        return np.array([], dtype=np.float32)
+# ── Шумоподавление ────────────────────────────────────────────────────────────
 
-    if not emit_levels:
-        audio = sd.rec(
-            n, **{k: v for k, v in _sd_kwargs().items() if k != "dtype"}, dtype=config.DTYPE
+class NoiseReducer:
+    """Спектральное шумоподавление (noisereduce) с профилем из калибровки."""
+
+    def __init__(self) -> None:
+        self.noise_profile: np.ndarray | None = None
+
+    def set_noise_profile(self, audio: np.ndarray) -> None:
+        if audio is not None and audio.size > int(config.SAMPLE_RATE * 0.2):
+            self.noise_profile = audio.copy()
+
+    def process(self, audio: np.ndarray) -> np.ndarray:
+        if not config.NOISE_REDUCE_ENABLED or not _HAVE_NR or audio.size == 0:
+            return audio
+        try:
+            import noisereduce as nr
+            y_noise = self.noise_profile
+            if y_noise is None or y_noise.size < 100:
+                y_noise = audio[: min(len(audio), int(config.SAMPLE_RATE * 0.4))]
+            out = nr.reduce_noise(
+                y=audio,
+                sr=config.SAMPLE_RATE,
+                y_noise=y_noise,
+                stationary=config.NOISE_REDUCE_STATIONARY,
+                prop_decrease=max(0.1, min(1.0, config.NOISE_REDUCE_PROP)),
+            )
+            return np.asarray(out, dtype=np.float32)
+        except Exception as exc:
+            logger.debug("noisereduce skip: %s", exc)
+            return audio
+
+
+# ── WebRTC VAD ────────────────────────────────────────────────────────────────
+
+class WebRTCVADHelper:
+    """webrtcvad: 30ms фреймы @ 16kHz."""
+
+    FRAME_SAMPLES = 480  # 30ms @ 16kHz
+
+    def __init__(self) -> None:
+        self._vad = None
+        if _HAVE_WEBRTC:
+            import webrtcvad
+            agg = max(0, min(3, config.WEBRTC_VAD_AGGRESSIVENESS))
+            self._vad = webrtcvad.Vad(agg)
+
+    @property
+    def available(self) -> bool:
+        return self._vad is not None
+
+    def speech_ratio(self, audio: np.ndarray) -> float:
+        if not self.available or audio.size < self.FRAME_SAMPLES:
+            return 0.0
+        pcm = _to_pcm16(audio)
+        speech_frames = 0
+        total_frames = 0
+        frame_bytes = self.FRAME_SAMPLES * 2
+        for i in range(0, len(pcm) - frame_bytes + 1, frame_bytes):
+            frame = pcm[i : i + frame_bytes]
+            try:
+                if self._vad.is_speech(frame, config.SAMPLE_RATE):
+                    speech_frames += 1
+            except Exception:
+                pass
+            total_frames += 1
+        return speech_frames / max(1, total_frames)
+
+    def is_speech(self, audio: np.ndarray) -> bool:
+        return self.speech_ratio(audio) >= config.WEBRTC_SPEECH_RATIO_ON
+
+
+# ── Silero VAD (опционально) ──────────────────────────────────────────────────
+
+class SileroVADHelper:
+    def __init__(self) -> None:
+        self._ready = False
+        self._get_speech_timestamps = None
+
+    def _ensure(self) -> bool:
+        global _silero_model, _silero_utils
+        if not config.SILERO_VAD_ENABLED:
+            return False
+        if self._ready:
+            return True
+        try:
+            import torch
+            _silero_model, _silero_utils = torch.hub.load(
+                "snakers4/silero-vad", "silero_vad", trust_repo=True,
+            )
+            self._get_speech_timestamps = _silero_utils[0]
+            self._ready = True
+            logger.info("Silero VAD loaded")
+            return True
+        except Exception as exc:
+            logger.warning("Silero VAD unavailable: %s", exc)
+            return False
+
+    def speech_probability(self, audio: np.ndarray) -> float:
+        if not self._ensure() or audio.size < 512:
+            return 0.0
+        try:
+            import torch
+            wav = torch.from_numpy(audio.astype(np.float32))
+            ts = self._get_speech_timestamps(
+                wav, _silero_model,
+                sampling_rate=config.SAMPLE_RATE,
+                threshold=config.SILERO_VAD_THRESHOLD,
+                min_speech_duration_ms=120,
+                min_silence_duration_ms=80,
+            )
+            return 1.0 if ts else 0.0
+        except Exception as exc:
+            logger.debug("silero: %s", exc)
+            return 0.0
+
+
+# ── Hybrid speech detector ────────────────────────────────────────────────────
+
+class HybridSpeechDetector:
+    """
+    Комбинирует RMS-порог + WebRTC + Silero для точного end-of-speech.
+    """
+
+    def __init__(self, *, thr_on: float, thr_off: float) -> None:
+        self.thr_on = thr_on
+        self.thr_off = thr_off
+        self.webrtc = WebRTCVADHelper()
+        self.silero = SileroVADHelper()
+
+    def is_speech(self, audio: np.ndarray, level: float, *, for_start: bool = False) -> bool:
+        backend = (config.VAD_BACKEND or "hybrid").lower()
+        thr = self.thr_on if for_start else self.thr_off
+
+        if backend == "rms":
+            return level >= thr
+
+        rms_hit = level >= thr
+        webrtc_hit = self.webrtc.is_speech(audio) if self.webrtc.available else False
+        silero_hit = (
+            self.silero.speech_probability(audio) >= config.SILERO_VAD_THRESHOLD
+            if config.SILERO_VAD_ENABLED else False
         )
-        sd.wait()
-        return audio.flatten().astype(np.float32)
 
-    chunk_n = int(config.SAMPLE_RATE * 0.12)
-    chunks: list[np.ndarray] = []
-    remaining = n
-    try:
-        with sd.InputStream(blocksize=chunk_n, **_sd_kwargs()) as stream:
-            while remaining > 0:
-                take = min(chunk_n, remaining)
-                data, _ = stream.read(take)
-                flat = np.asarray(data, dtype=np.float32).flatten()
-                chunks.append(flat)
-                _emit_mic(_voice_level(flat))
-                remaining -= take
-    except Exception as exc:
-        logger.error("stream record failed: %s", exc)
-        return np.array([], dtype=np.float32)
-    return np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
+        if backend == "webrtc":
+            return webrtc_hit or rms_hit
+
+        # hybrid: любой сильный сигнал + подтверждение WebRTC/Silero
+        if rms_hit:
+            return True
+        if webrtc_hit and level >= thr * 0.65:
+            return True
+        if silero_hit:
+            return True
+        return False
 
 
-# ── Continuous VAD v2 ─────────────────────────────────────────────────────────
+# ── openWakeWord (опционально) ────────────────────────────────────────────────
+
+class OpenWakeWordDetector:
+    def __init__(self) -> None:
+        self._model = None
+        if config.OPENWAKEWORD_ENABLED and _HAVE_OWW:
+            try:
+                from openwakeword.model import Model
+                if config.OPENWAKEWORD_MODEL:
+                    self._model = Model(
+                        wakeword_models=[config.OPENWAKEWORD_MODEL],
+                        inference_framework="onnx",
+                    )
+                else:
+                    self._model = Model(inference_framework="onnx")
+                logger.info("openWakeWord loaded")
+            except Exception as exc:
+                logger.warning("openWakeWord init failed: %s", exc)
+
+    def detect(self, audio: np.ndarray) -> bool:
+        if self._model is None or audio.size == 0:
+            return False
+        try:
+            pcm = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
+            scores = self._model.predict(pcm)
+            for _, score in (scores or {}).items():
+                if float(score) >= config.OPENWAKEWORD_THRESHOLD:
+                    return True
+        except Exception as exc:
+            logger.debug("oww: %s", exc)
+        return False
+
+
+# ── Low-power wake listener ───────────────────────────────────────────────────
+
+class LowPowerWakeListener:
+    """
+    IDLE режим: постоянный поток микрофона, energy gate + WebRTC.
+    Whisper STT только когда в буфере есть речь — минимум ложных срабатываний.
+    """
+
+    def __init__(self) -> None:
+        self.chunk_n = max(128, int(config.SAMPLE_RATE * config.WAKE_IDLE_CHUNK_MS / 1000))
+        self.dt = self.chunk_n / config.SAMPLE_RATE
+        self.webrtc = WebRTCVADHelper()
+        self.oww = OpenWakeWordDetector()
+        self.noise_floor = 0.008
+        self.calibrated = False
+        self.calib_levels: list[float] = []
+        self.calib_need = max(2, int(config.WAKE_CALIBRATION_SEC / self.dt))
+        self.buffer: deque[np.ndarray] = deque(
+            maxlen=max(3, int(config.WAKE_BUFFER_SEC / self.dt))
+        )
+
+    def _energy_threshold(self) -> float:
+        return max(
+            config.VAD_SPEECH_THRESHOLD * 0.5,
+            self.noise_floor * config.WAKE_MIN_ENERGY_MULT,
+        )
+
+    def _calibrate(self, level: float) -> None:
+        self.calib_levels.append(level)
+        if len(self.calib_levels) >= self.calib_need:
+            self.noise_floor = float(np.percentile(self.calib_levels, 35))
+            self.calibrated = True
+            logger.info("idle calibrated: noise_floor=%.5f thr=%.5f", self.noise_floor, self._energy_threshold())
+
+    def _chunk_passes_gate(self, chunk: np.ndarray, level: float) -> bool:
+        if not self.calibrated:
+            return False
+        if config.WAKE_ENERGY_GATE and level < self._energy_threshold():
+            return False
+        if config.WAKE_SPEECH_REQUIRED and self.webrtc.available:
+            if not self.webrtc.is_speech(chunk):
+                return False
+        return True
+
+    def wait_for_wake(self) -> bool:
+        if consume_force_wake():
+            self._fire_wake("force")
+            return True
+
+        _emit_vad("idle")
+        backend = config.WAKE_BACKEND
+        logger.debug("idle listen: backend=%s chunk=%.0fms", backend, self.dt * 1000)
+
+        try:
+            time.sleep(config.VAD_MIC_WARMUP_SEC)
+            with sd.InputStream(blocksize=self.chunk_n, **_sd_kwargs()) as stream:
+                while True:
+                    if consume_force_wake():
+                        self._fire_wake("force")
+                        return True
+
+                    data, overflowed = stream.read(self.chunk_n)
+                    if overflowed:
+                        logger.warning("idle audio overflow")
+                    chunk = np.asarray(data, dtype=np.float32).flatten()
+                    chunk = _highpass(chunk)
+                    level = _voice_level(chunk)
+                    _emit_mic(level, idle=True)
+
+                    if not self.calibrated:
+                        self._calibrate(level)
+                        continue
+
+                    # openWakeWord на каждом чанке (лёгкий)
+                    if config.OPENWAKEWORD_ENABLED and self.oww.detect(chunk):
+                        self._fire_wake("openwakeword")
+                        return True
+
+                    if not self._chunk_passes_gate(chunk, level):
+                        self.buffer.clear()
+                        time.sleep(config.WAKE_POLL_INTERVAL * 0.5)
+                        continue
+
+                    self.buffer.append(chunk)
+                    if len(self.buffer) < self.buffer.maxlen:
+                        continue
+
+                    audio = np.concatenate(list(self.buffer))
+                    self.buffer.clear()
+                    text = self._transcribe_wake(audio)
+                    if _has_wake(text):
+                        self._fire_wake(f"whisper:{text[:40]!r}")
+                        return True
+
+                    time.sleep(config.WAKE_POLL_INTERVAL)
+        except Exception as exc:
+            logger.error("idle listen error: %s", exc)
+            time.sleep(config.WAKE_POLL_INTERVAL)
+            return False
+
+    def _transcribe_wake(self, audio: np.ndarray) -> str:
+        audio = _normalize(_highpass(audio))
+        try:
+            segments, _ = _get_whisper().transcribe(
+                audio,
+                language=config.WHISPER_LANGUAGE,
+                beam_size=3,
+                best_of=2,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 200, "threshold": 0.4},
+                no_speech_threshold=0.55,
+                condition_on_previous_text=False,
+                temperature=0.0,
+            )
+            return _clean_text(" ".join(s.text.strip() for s in segments))
+        except Exception as exc:
+            logger.warning("wake STT: %s", exc)
+            reset_whisper_model()
+            return ""
+
+    def _fire_wake(self, reason: str) -> None:
+        logger.info("wake detected [%s]", reason)
+        _emit_vad("wake")
+        if _on_wake:
+            try:
+                _on_wake()
+            except Exception:
+                pass
+
+
+# ── Continuous VAD v3 (post-wake) ─────────────────────────────────────────────
 
 class ContinuousVAD:
     """
-    Voice Activity Detection для непрерывной записи после wake-word.
-
-    Алгоритм:
-      1. Lead-in — микрофон уже пишет во время TTS «Слушаю»
-      2. Калибровка шума (медиана уровня фона)
-      3. Pre-roll ring buffer — не обрезает начало фразы
-      4. Attack — N чанков подряд выше порога → старт записи
-      5. Release + hangover — короткие паузы внутри фразы не завершают запись
-      6. Адаптивный noise floor во время ожидания/записи
-      7. Мягкая обрезка хвостовой тишины + end padding
+    Полноценный VAD после wake-word: hybrid detector + end-of-speech.
+    Pre-roll, hangover, адаптивный порог, шумоподавление перед Whisper.
     """
 
     def __init__(self, *, lead_in_sec: float = 0.0) -> None:
@@ -252,7 +563,7 @@ class ContinuousVAD:
         self.dt = self.chunk_n / config.SAMPLE_RATE
 
         speech_m, silence_m, release_m, attack_m = config.vad_sensitivity_scale()
-        self.release_sec = config.vad_release_sec()
+        self.release_sec = config.vad_release_sec() if config.END_OF_SPEECH_ENABLED else config.VAD_MAX_RECORD_SEC
         self.release_chunks = max(6, int(self.release_sec / self.dt))
         self.hang_extra = max(3, int(config.VAD_HANGOVER_SEC / self.dt))
         self.long_speech_bonus_chunks = max(0, int(config.VAD_LONG_SPEECH_BONUS_SEC / self.dt))
@@ -266,10 +577,13 @@ class ContinuousVAD:
         self.noise_floor = 0.0
         self.thr_on = config.VAD_SPEECH_THRESHOLD * speech_m
         self.thr_off = config.VAD_SILENCE_THRESHOLD * silence_m
+        self.detector = HybridSpeechDetector(thr_on=self.thr_on, thr_off=self.thr_off)
+        self.noise_reducer = NoiseReducer()
 
         self.recorded: list[np.ndarray] = []
         self.pre_roll: deque[np.ndarray] = deque(maxlen=self.pre_max)
         self.smooth_buf: deque[float] = deque(maxlen=config.VAD_RMS_SMOOTH_WINDOW)
+        self.calib_audio: list[np.ndarray] = []
 
         self.phase = VADPhase.LEAD_IN if lead_in_sec > 0 else VADPhase.CALIBRATING
         self.lead_in_left = max(0.0, lead_in_sec)
@@ -293,51 +607,57 @@ class ContinuousVAD:
         self.thr_off = max(
             config.VAD_SILENCE_THRESHOLD * silence_m,
             base * config.VAD_NOISE_MULT_OFF,
-            self.thr_on * 0.55,  # гистерезис: off < on
+            self.thr_on * 0.55,
         )
+        self.detector.thr_on = self.thr_on
+        self.detector.thr_off = self.thr_off
         logger.info(
-            "VAD calibrated: noise=%.5f thr_on=%.5f thr_off=%.5f release=%.1fs hang=%.1fs",
-            self.noise_floor, self.thr_on, self.thr_off, self.release_sec, config.VAD_HANGOVER_SEC,
+            "VAD calibrated: noise=%.5f thr_on=%.5f thr_off=%.5f release=%.1fs backend=%s",
+            self.noise_floor, self.thr_on, self.thr_off, self.release_sec, config.VAD_BACKEND,
         )
 
     def _adapt_noise(self, level: float) -> None:
-        """Медленная подстройка порога к изменению фонового шума."""
         alpha = config.VAD_ADAPTIVE_NOISE_ALPHA
         if alpha <= 0:
             return
         self.noise_floor = (1.0 - alpha) * self.noise_floor + alpha * level
         self._update_thresholds()
 
-    def _calibrate_sample(self, level: float, *, defer_waiting: bool = False) -> bool:
-        """Собрать фоновый шум. defer_waiting=True — не выходить из lead-in раньше TTS."""
+    def _calibrate_sample(self, level: float, chunk: np.ndarray, *, defer_waiting: bool = False) -> bool:
         self.calib_levels.append(level)
+        self.calib_audio.append(chunk)
         self.calib_done += 1
         if self.calib_done < self.calib_chunks:
             return False
         self.noise_floor = float(np.percentile(self.calib_levels, 30)) if self.calib_levels else level
         self._update_thresholds()
+        if self.calib_audio:
+            prof = np.concatenate(self.calib_audio[-self.calib_chunks:])
+            self.noise_reducer.set_noise_profile(prof)
         if not defer_waiting:
             self.phase = VADPhase.WAITING
             _emit_vad("waiting")
         return True
 
-    def _debug_log(self, level: float) -> None:
+    def _debug_log(self, level: float, *, speech: bool) -> None:
         if not config.VAD_DEBUG_LOG:
             return
         if self.total_t - self._last_debug_t < config.VAD_DEBUG_LOG_INTERVAL_SEC:
             return
         self._last_debug_t = self.total_t
+        wr = self.detector.webrtc.speech_ratio(self.recorded[-1]) if self.recorded else 0.0
         logger.info(
-            "VAD [%s] lvl=%.5f on=%.5f off=%.5f streak=%d silent=%d speech=%.1fs",
-            self.phase.name, level, self.thr_on, self.thr_off,
-            self.speech_streak, self.silent_run, self.speech_t,
+            "VAD [%s] lvl=%.5f speech=%s webrtc=%.2f on=%.5f off=%.5f silent=%d speech_t=%.1fs",
+            self.phase.name, level, speech, wr, self.thr_on, self.thr_off,
+            self.silent_run, self.speech_t,
         )
 
     def _in_hangover(self) -> bool:
         return (self.total_t - self.last_voice_t) < config.VAD_HANGOVER_SEC
 
     def _release_threshold_chunks(self) -> int:
-        """Сколько тихих чанков нужно для завершения записи."""
+        if not config.END_OF_SPEECH_ENABLED:
+            return max(self.release_chunks, int(config.VAD_MAX_RECORD_SEC / self.dt))
         extra = self.hang_extra if self._in_hangover() else 0
         if self.speech_t >= 5.0:
             extra += self.long_speech_bonus_chunks
@@ -360,62 +680,50 @@ class ContinuousVAD:
         self._end_reason = reason
         _emit_vad(reason)
         dur = len(self.recorded) * self.dt if self.recorded else 0.0
-        logger.info(
-            "VAD end [%s] speech=%.1fs recorded=%.1fs silent_run=%d",
-            reason, self.speech_t, dur, self.silent_run,
-        )
+        logger.info("VAD end-of-speech [%s] speech=%.1fs recorded=%.2fs", reason, self.speech_t, dur)
         return True
 
     def process_chunk(self, data: np.ndarray) -> bool:
-        """Обработать один аудио-чанк. True = запись завершена."""
+        data = _highpass(data)
         level = _smooth(_voice_level(data), self.smooth_buf)
+        is_speech = self.detector.is_speech(data, level, for_start=not self.started)
         _emit_mic(level)
         self.total_t += self.dt
-        self._debug_log(level)
+        self._debug_log(level, speech=is_speech)
 
-        # ── Lead-in: пишем pre-roll пока играет TTS ──
         if self.phase == VADPhase.LEAD_IN:
             self.pre_roll.append(data)
             self.lead_in_left -= self.dt
-            self._calibrate_sample(level, defer_waiting=True)
+            self._calibrate_sample(level, data, defer_waiting=True)
             if self.lead_in_left <= 0:
-                if self.calib_done < self.calib_chunks:
-                    self.phase = VADPhase.CALIBRATING
-                    _emit_vad("calibrating")
-                else:
-                    self.phase = VADPhase.WAITING
-                    _emit_vad("waiting")
+                self.phase = VADPhase.CALIBRATING if self.calib_done < self.calib_chunks else VADPhase.WAITING
+                _emit_vad(self.phase.name.lower())
             return False
 
-        # ── Калибровка шума ──
         if self.phase == VADPhase.CALIBRATING:
             self.pre_roll.append(data)
-            if self._calibrate_sample(level):
+            if self._calibrate_sample(level, data):
                 pass
             return False
 
-        # ── Ожидание начала речи (attack) ──
         if not self.started:
             self.wait_t += self.dt
             self.pre_roll.append(data)
-
-            if level >= self.thr_on:
+            if is_speech:
                 self.speech_streak += 1
             else:
                 self.speech_streak = max(0, self.speech_streak - 1)
                 self._adapt_noise(level)
-
             if self.speech_streak >= self.attack_need:
                 self._begin_recording(level)
             elif self.wait_t >= config.VAD_WAIT_SPEECH_SEC:
                 return self._finish("timeout")
             return False
 
-        # ── Активная запись (release + hangover) ──
         self.recorded.append(data)
         self.speech_t += self.dt
 
-        if level >= self.thr_off:
+        if is_speech:
             self.silent_run = 0
             self.last_voice_t = self.total_t
         else:
@@ -423,36 +731,33 @@ class ContinuousVAD:
             if self.silent_run % 8 == 0:
                 self._adapt_noise(level)
 
-        if self.silent_run >= self._release_threshold_chunks() and self.speech_t >= config.VAD_MIN_SPEECH_SEC:
+        if (
+            config.END_OF_SPEECH_ENABLED
+            and self.silent_run >= self._release_threshold_chunks()
+            and self.speech_t >= config.VAD_MIN_SPEECH_SEC
+        ):
             return self._finish("done")
 
         if self.total_t >= config.VAD_MAX_RECORD_SEC:
             return self._finish("max_duration")
-
         return False
 
     def _trim_trailing_silence(self, audio: np.ndarray) -> np.ndarray:
-        """Мягкая обрезка хвоста — не срезаем конец слов."""
         if not config.VAD_TRIM_TRAILING or audio.size < self.chunk_n * 3:
             return audio
-
         levels: list[float] = []
         for i in range(0, len(audio) - self.chunk_n, self.chunk_n):
             levels.append(_voice_level(audio[i : i + self.chunk_n]))
-
         cut_chunks = 0
         for lvl in reversed(levels):
             if lvl < self.thr_off:
                 cut_chunks += 1
             else:
                 break
-
-        # Оставляем 40% хвостовой тишины + end padding
         keep_tail = max(1, int(0.4 / self.dt))
         cut_chunks = max(0, cut_chunks - keep_tail)
         if cut_chunks <= 0:
             return audio
-
         cut_samples = cut_chunks * self.chunk_n
         pad = int(config.VAD_END_PADDING_SEC * config.SAMPLE_RATE)
         end = max(self.chunk_n * 2, len(audio) - cut_samples + pad)
@@ -463,16 +768,19 @@ class ContinuousVAD:
             return np.array([], dtype=np.float32)
         audio = np.concatenate(self.recorded)
         audio = self._trim_trailing_silence(audio)
+        audio = self.noise_reducer.process(audio)
         out = _normalize(_highpass(audio))
         logger.info(
-            "VAD audio ready: %.2fs rms=%.5f reason=%s",
+            "VAD audio ready: %.2fs rms=%.5f reason=%s nr=%s",
             out.size / config.SAMPLE_RATE, _rms(out), self._end_reason or "—",
+            config.NOISE_REDUCE_ENABLED and _HAVE_NR,
         )
         return out
 
 
 def record_continuous(*, lead_in_sec: float = 0.0) -> np.ndarray:
-    """Запись команды с continuous VAD. lead_in_sec — буфер во время TTS."""
+    """ACTIVE режим: запись команды до end-of-speech."""
+    _emit_vad("active")
     vad = ContinuousVAD(lead_in_sec=lead_in_sec)
     if vad.phase == VADPhase.CALIBRATING:
         _emit_vad("calibrating")
@@ -486,7 +794,7 @@ def record_continuous(*, lead_in_sec: float = 0.0) -> np.ndarray:
             while vad.phase != VADPhase.DONE:
                 chunk, overflowed = stream.read(chunk_n)
                 if overflowed:
-                    logger.warning("audio buffer overflow — увеличь buffer в ОС")
+                    logger.warning("active audio overflow")
                 data = np.asarray(chunk, dtype=np.float32).flatten()
                 if vad.process_chunk(data):
                     break
@@ -494,7 +802,6 @@ def record_continuous(*, lead_in_sec: float = 0.0) -> np.ndarray:
         logger.error("record_continuous failed: %s", exc)
         _emit_vad("error")
         return np.array([], dtype=np.float32)
-
     return vad.get_audio()
 
 
@@ -536,21 +843,13 @@ def _transcribe_once(audio: np.ndarray, *, vad_filter: bool) -> str:
 
 def transcribe(audio: np.ndarray) -> str:
     if audio is None or audio.size < int(config.SAMPLE_RATE * 0.12):
-        logger.debug("STT: audio too short (%.2fs)", (audio.size if audio is not None else 0) / config.SAMPLE_RATE)
         return ""
-
     audio = _normalize(_highpass(audio))
-    rms = _rms(audio)
-    if rms < config.VAD_SILENCE_THRESHOLD * 0.06:
-        logger.debug("STT: audio too quiet rms=%.5f", rms)
+    if _rms(audio) < config.VAD_SILENCE_THRESHOLD * 0.06:
         return ""
-
-    # Padding — Whisper лучше распознаёт длинные фразы с паузами по краям
     pad = int(config.SAMPLE_RATE * 0.35)
     audio_padded = np.pad(audio, (pad, pad), mode="constant")
-
     try:
-        # Сначала без whisper-vad — наш VAD уже выделил речь
         for attempt, (data, use_vad) in enumerate([
             (audio_padded, False),
             (audio, False),
@@ -560,7 +859,6 @@ def transcribe(audio: np.ndarray) -> str:
                 text = _transcribe_once(data, vad_filter=use_vad)
                 if text:
                     return text
-                logger.warning("STT empty attempt %d (vad=%s)", attempt, use_vad)
             except Exception as exc:
                 logger.warning("STT attempt %d failed: %s", attempt, exc)
                 reset_whisper_model()
@@ -583,26 +881,27 @@ def _has_wake(text: str) -> bool:
     norm = _norm_wake(text)
     if not norm:
         return False
+    config.ensure_wake_aliases()
     return any(alias in norm for alias in sorted(config.WAKE_WORD_ALIASES, key=len, reverse=True))
 
 
-def listen_chunk(sec: float | None = None) -> str:
-    return transcribe(_record_fixed(sec or config.WAKE_CHUNK_SEC, emit_levels=True))
+_idle_listener: LowPowerWakeListener | None = None
 
 
-def listen_command() -> str:
-    """Continuous VAD без TTS (если «Слушаю» уже произнесено)."""
-    delay = max(0.0, config.POST_TTS_DELAY_SEC)
-    if delay > 0:
-        time.sleep(delay)
-    return transcribe(record_continuous())
+def _get_idle_listener() -> LowPowerWakeListener:
+    global _idle_listener
+    if _idle_listener is None:
+        _idle_listener = LowPowerWakeListener()
+    return _idle_listener
+
+
+def wait_for_wake_word() -> bool:
+    """IDLE low-power: слушает только wake-word."""
+    return _get_idle_listener().wait_for_wake()
 
 
 def listen_after_wake() -> str:
-    """
-    TTS «Слушаю» + continuous VAD параллельно.
-    Микрофон открывается сразу — начало длинной команды не теряется.
-    """
+    """TTS «Слушаю» + ACTIVE VAD параллельно (не теряем начало фразы)."""
     audio_box: list[np.ndarray] = []
     err_box: list[Exception] = []
 
@@ -612,49 +911,25 @@ def listen_after_wake() -> str:
         except Exception as exc:
             err_box.append(exc)
 
-    rec = threading.Thread(target=_record_worker, daemon=True, name="vad-parallel")
+    rec = threading.Thread(target=_record_worker, daemon=True, name="vad-active")
     rec.start()
     time.sleep(config.VAD_MIC_WARMUP_SEC)
     speak(config.CONFIRM_WAKE)
     rec.join(timeout=config.VAD_MAX_RECORD_SEC + 15.0)
 
     if err_box:
-        logger.error("listen_after_wake record: %s", err_box[0])
+        logger.error("listen_after_wake: %s", err_box[0])
         return ""
-
     if not audio_box:
-        logger.warning("listen_after_wake: no audio captured")
         return ""
-
     return transcribe(audio_box[0])
 
 
-def wait_for_wake_word() -> bool:
-    """Ожидание wake-word или force wake (GUI)."""
-    if consume_force_wake():
-        logger.info("force wake triggered")
-        if _on_wake:
-            try:
-                _on_wake()
-            except Exception:
-                pass
-        return True
-
-    try:
-        text = listen_chunk(config.WAKE_CHUNK_SEC)
-        if _has_wake(text):
-            logger.info("wake-word detected: %r", text)
-            if _on_wake:
-                try:
-                    _on_wake()
-                except Exception:
-                    pass
-            return True
-        return False
-    except Exception as exc:
-        logger.error("wake-word error: %s", exc)
-        time.sleep(config.WAKE_POLL_INTERVAL)
-        return False
+def listen_command() -> str:
+    delay = max(0.0, config.POST_TTS_DELAY_SEC)
+    if delay > 0:
+        time.sleep(delay)
+    return transcribe(record_continuous())
 
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
@@ -677,19 +952,16 @@ def _edge_tts_to_file(text: str, path: Path) -> bool:
     for attempt in range(config.TTS_EDGE_RETRIES):
         try:
             if _run_async_safe(_edge_tts_save(text, path)):
-                logger.debug("edge-tts OK attempt %d", attempt + 1)
                 return True
         except Exception as exc:
-            logger.warning("edge-tts attempt %d/%d: %s", attempt + 1, config.TTS_EDGE_RETRIES, exc)
+            logger.warning("edge-tts attempt %d: %s", attempt + 1, exc)
             time.sleep(0.5 * (attempt + 1))
     return False
 
 
 def _sapi_speak(text: str) -> bool:
-    """SAPI fallback с поддержкой кириллицы через временный UTF-8 файл."""
     if not config.TTS_USE_SAPI_FALLBACK:
         return False
-
     txt_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -697,7 +969,6 @@ def _sapi_speak(text: str) -> bool:
         ) as f:
             f.write(text)
             txt_path = Path(f.name)
-
         rate = config.TTS_SAPI_RATE
         ps = (
             "Add-Type -AssemblyName System.Speech; "
@@ -710,7 +981,6 @@ def _sapi_speak(text: str) -> bool:
             ["powershell", "-NoProfile", "-Command", ps],
             check=True, capture_output=True, timeout=120,
         )
-        logger.info("TTS via SAPI (Unicode)")
         return True
     except Exception as exc:
         logger.warning("SAPI TTS failed: %s", exc)
@@ -728,14 +998,14 @@ def _play_mp3(path: Path) -> bool:
         from playsound3 import playsound
         playsound(str(path), block=True)
         return True
-    except Exception as exc:
-        logger.warning("playsound failed: %s — trying winsound", exc)
+    except Exception:
+        pass
     try:
         import winsound
         winsound.PlaySound(str(path), winsound.SND_FILENAME)
         return True
     except Exception as exc:
-        logger.warning("winsound failed: %s", exc)
+        logger.warning("play failed: %s", exc)
         return False
 
 
@@ -750,10 +1020,7 @@ def speak(text: str) -> None:
             tmp = Path(f.name)
         if _edge_tts_to_file(text, tmp) and _play_mp3(tmp):
             return
-        logger.info("TTS fallback → SAPI")
-        if _sapi_speak(text):
-            return
-        logger.error("TTS: all methods failed for %r", text[:60])
+        _sapi_speak(text)
     except Exception as exc:
         logger.error("TTS error: %s", exc)
         _sapi_speak(text)
@@ -799,10 +1066,15 @@ class VoiceEngine:
     def get_whisper_status(self) -> str:
         try:
             _get_whisper()
-            return f"{config.WHISPER_MODEL} ({config.WHISPER_DEVICE}/int8)"
+            backends = get_voice_backends()
+            active = [k for k, v in backends.items() if v]
+            return f"{config.WHISPER_MODEL} ({config.WHISPER_DEVICE}) | {','.join(active) or 'rms'}"
         except Exception as exc:
             return f"ошибка: {exc}"
 
     def reload(self) -> None:
         config.reload_settings()
+        config.ensure_wake_aliases()
         reset_whisper_model()
+        global _idle_listener
+        _idle_listener = None
