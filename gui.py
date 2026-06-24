@@ -1,5 +1,5 @@
 """
-Windy AI Assistant v9.0 — современный GUI (CustomTkinter).
+Windy AI Assistant v9.1 — современный GUI (CustomTkinter).
 
 Страницы:
   - Главная: wake-word, VAD, быстрая команда

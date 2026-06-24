@@ -134,7 +134,7 @@ PLUGINS_ENABLED = True
 GUI_THEME = "dark"
 GUI_ACCENT = "#6366f1"
 GUI_ACCENT_HOVER = "#4f46e5"
-GUI_VERSION = "v9.0"
+GUI_VERSION = "v9.1"
 GUI_SUCCESS = "#22c55e"
 GUI_WARNING = "#f59e0b"
 GUI_DANGER = "#ef4444"
@@ -316,16 +316,28 @@ _SEARCH_PREFIXES: tuple[tuple[str, str], ...] = (
     ("гугл", "google"),
 )
 
-# Дефолтные пути (если settings.json пуст)
+# Дефолтные пути Windows 11 (если settings.json пуст / скан не нашёл)
 DEFAULT_APP_PATHS: dict[str, str] = {
     "chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    "edge": r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    "firefox": r"C:\Program Files\Mozilla Firefox\firefox.exe",
     "telegram": os.path.expandvars(r"%APPDATA%\Telegram Desktop\Telegram.exe"),
     "discord": os.path.expandvars(r"%LOCALAPPDATA%\Discord\Update.exe --processStart Discord.exe"),
     "steam": r"C:\Program Files (x86)\Steam\steam.exe",
+    "spotify": os.path.expandvars(r"%APPDATA%\Spotify\Spotify.exe"),
+    "vscode": os.path.expandvars(r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe"),
     "notepad": "notepad.exe",
     "explorer": "explorer.exe",
     "calc": "calc.exe",
+    "mspaint": "mspaint.exe",
+    "snippingtool": "snippingtool.exe",
 }
+
+# Приоритет при автозаполнении APP_PATHS
+_PRIORITY_APPS: tuple[str, ...] = (
+    "chrome", "edge", "firefox", "telegram", "discord", "steam",
+    "spotify", "vscode", "notepad", "calc", "explorer",
+)
 
 _scanned_cache: dict[str, str] | None = None
 
@@ -444,12 +456,12 @@ def normalize_app_name(name: str) -> str:
     return APP_ALIASES.get(n, n)
 
 
-def _get_scanned_apps() -> dict[str, str]:
+def _get_scanned_apps(*, refresh: bool = False) -> dict[str, str]:
     global _scanned_cache
-    if _scanned_cache is None:
+    if _scanned_cache is None or refresh:
         try:
             import app_scanner
-            _scanned_cache = app_scanner.scan_installed_apps(include_start_menu=False)
+            _scanned_cache = app_scanner.scan_installed_apps(include_start_menu=True)
         except Exception as exc:
             logger.warning("app scan cache failed: %s", exc)
             _scanned_cache = {}
@@ -461,41 +473,76 @@ def invalidate_app_cache() -> None:
     _scanned_cache = None
 
 
-def resolve_app_path(name: str) -> tuple[str | None, str]:
+def get_effective_app_paths() -> dict[str, str]:
     """
-    Найти путь к приложению.
-    Порядок: APP_PATHS → partial match → auto-scan → DEFAULT_APP_PATHS.
-    Возвращает (path, canonical_key).
+    Полный каталог приложений для LAUNCH_APP.
+    Приоритет: ручные → settings → скан → defaults.
+    """
+    merged: dict[str, str] = {}
+    merged.update(DEFAULT_APP_PATHS)
+    merged.update(_get_scanned_apps())
+    merged.update(APP_PATHS)
+    merged.update(APP_PATHS_MANUAL)
+    return {k: v for k, v in merged.items() if v and _path_exists(v)}
+
+
+def resolve_app_path(name: str) -> tuple[str | None, str, str]:
+    """
+    Найти путь к приложению для LAUNCH_APP.
+    Порядок: manual → APP_PATHS → scan (aliases) → defaults → fuzzy.
+    Возвращает (path, canonical_key, source).
     """
     key = normalize_app_name(name)
     if not key:
-        return None, ""
+        return None, "", ""
 
-    if key in APP_PATHS and APP_PATHS[key]:
-        p = APP_PATHS[key]
-        if _path_exists(p):
-            return p, key
+    try:
+        import app_scanner
+        canon = app_scanner.resolve_canonical_key(key)
+        if canon:
+            key = canon
+    except Exception:
+        pass
 
-    for k, v in APP_PATHS.items():
-        if key in k or k in key:
-            if _path_exists(v):
-                return v, k
+    # 1) Ручные пути (высший приоритет)
+    if key in APP_PATHS_MANUAL and _path_exists(APP_PATHS_MANUAL[key]):
+        return APP_PATHS_MANUAL[key], key, "manual"
 
+    # 2) settings.json
+    if key in APP_PATHS and _path_exists(APP_PATHS[key]):
+        return APP_PATHS[key], key, "settings"
+
+    # 3) Автоскан
     scanned = _get_scanned_apps()
     if key in scanned and _path_exists(scanned[key]):
-        return scanned[key], key
+        return scanned[key], key, "scan"
+
+    try:
+        import app_scanner
+        hit = app_scanner.lookup_in_catalog(key, scanned)
+        if hit:
+            path, alias = hit
+            return path, alias, "scan-alias"
+    except Exception:
+        pass
+
     for k, v in scanned.items():
         if key in k or k in key:
             if _path_exists(v):
-                return v, k
+                return v, k, "scan-fuzzy"
 
-    if key in DEFAULT_APP_PATHS:
-        p = DEFAULT_APP_PATHS[key]
-        if _path_exists(p):
-            logger.info("app %s from defaults: %s", key, p)
-            return p, key
+    # 4) Defaults
+    if key in DEFAULT_APP_PATHS and _path_exists(DEFAULT_APP_PATHS[key]):
+        logger.info("app %s from defaults: %s", key, DEFAULT_APP_PATHS[key])
+        return DEFAULT_APP_PATHS[key], key, "default"
 
-    return None, key
+    # 5) Fuzzy в APP_PATHS
+    for k, v in APP_PATHS.items():
+        if key in k or k in key:
+            if _path_exists(v):
+                return v, k, "settings-fuzzy"
+
+    return None, key, ""
 
 
 def _path_exists(spec: str) -> bool:
@@ -532,19 +579,21 @@ def validate_app_paths() -> None:
 
 
 def ensure_app_paths() -> None:
-    """Заполнить APP_PATHS из скана, если settings пуст."""
+    """Заполнить/починить APP_PATHS: скан + defaults + ручные."""
     global APP_PATHS
-    if APP_PATHS:
-        validate_app_paths()
-        return
     try:
         import app_scanner
-        found = app_scanner.scan_installed_apps(include_start_menu=False)
-        for k in ("chrome", "telegram", "discord", "steam", "notepad", "calc"):
-            if k in found:
-                APP_PATHS[k] = found[k]
+        found = app_scanner.scan_installed_apps(include_start_menu=True)
+        for k in _PRIORITY_APPS:
+            if k in found and _path_exists(found[k]):
+                if k not in APP_PATHS or not _path_exists(APP_PATHS.get(k, "")):
+                    APP_PATHS[k] = found[k]
+        for k, v in APP_PATHS_MANUAL.items():
+            if _path_exists(v):
+                APP_PATHS[k] = v
+        validate_app_paths()
         if APP_PATHS:
-            logger.info("auto-filled %d apps", len(APP_PATHS))
+            logger.info("app paths ready: %d (%s)", len(APP_PATHS), ", ".join(sorted(APP_PATHS)[:8]))
     except Exception as exc:
         logger.warning("ensure_app_paths: %s", exc)
 

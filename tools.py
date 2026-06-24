@@ -232,7 +232,7 @@ def _open_url_in_browser(url: str) -> tuple[bool, str]:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    chrome_path, _ = config.resolve_app_path("chrome")
+    chrome_path, _, _ = config.resolve_app_path("chrome")
     if chrome_path:
         chrome_exe = chrome_path.split(" --")[0].strip()
         if Path(chrome_exe).exists():
@@ -242,7 +242,7 @@ def _open_url_in_browser(url: str) -> tuple[bool, str]:
             except Exception as exc:
                 logger.warning("chrome launch failed: %s", exc)
 
-    edge_path, _ = config.resolve_app_path("edge")
+    edge_path, _, _ = config.resolve_app_path("edge")
     if edge_path:
         edge_exe = edge_path.split(" --")[0].strip()
         if Path(edge_exe).exists():
@@ -272,7 +272,7 @@ def _tool_open_browser(params: dict[str, Any]) -> str:
     prefer_app = bool(params.get("prefer_app") or params.get("app"))
     if prefer_app or (config.is_ambiguous_app_site(raw) and not params.get("browser")):
         app_key = config.normalize_app_name(raw)
-        app_path, key = config.resolve_app_path(app_key or raw)
+        app_path, key, _ = config.resolve_app_path(app_key or raw)
         if app_path:
             ok, detail = _launch_executable(app_path)
             if ok:
@@ -473,45 +473,55 @@ def _parse_launch_spec(spec: str) -> list[str]:
 def _launch_executable(spec: str) -> tuple[bool, str]:
     """
     Запуск приложения Windows. Возвращает (успех, детали).
-    Поддерживает: полный путь, notepad.exe, discord Update.exe --processStart.
+    Порядок: PATH → startfile (1 exe) → Popen → shell fallback.
     """
+    spec = (spec or "").strip()
     argv = _parse_launch_spec(spec)
     if not argv:
         return False, "путь пуст"
 
     exe = argv[0]
     exe_path = Path(exe)
+    logger.info("launch attempt: %s", spec)
 
     # Системные команды в PATH (notepad.exe, calc.exe)
     if not exe_path.is_absolute() and "\\" not in exe and "/" not in exe:
         try:
-            proc = subprocess.Popen(argv, shell=False)
+            proc = subprocess.Popen(
+                argv, shell=False,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
             logger.info("launched PATH app %s pid=%s", exe, proc.pid)
             return True, f"PID {proc.pid}"
         except FileNotFoundError:
-            pass
+            logger.debug("PATH launch miss: %s", exe)
 
     if not exe_path.exists():
         return False, f"файл не найден: {exe}"
 
-    # Простой exe без аргументов — os.startfile надёжнее на Windows
+    # Простой exe — os.startfile надёжнее на Windows 11
     if len(argv) == 1:
         try:
             os.startfile(exe)  # type: ignore[attr-defined]
-            logger.info("startfile: %s", exe)
+            logger.info("startfile OK: %s", exe)
             return True, exe
         except Exception as exc:
-            logger.warning("startfile failed %s: %s", exe, exc)
+            logger.warning("startfile failed %s: %s — trying Popen", exe, exc)
 
     try:
         cwd = str(exe_path.parent) if exe_path.parent.exists() else None
-        proc = subprocess.Popen(argv, cwd=cwd, shell=False)
-        logger.info("launched %s pid=%s argv=%s", exe, proc.pid, argv[1:])
+        proc = subprocess.Popen(
+            argv, cwd=cwd, shell=False,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        logger.info("Popen OK: %s pid=%s args=%s", exe, proc.pid, argv[1:])
         return True, f"PID {proc.pid}"
     except Exception as exc:
         logger.warning("Popen failed %s: %s — trying shell", spec, exc)
         try:
-            subprocess.Popen(f'"{argv[0]}"' + (" " + " ".join(argv[1:]) if len(argv) > 1 else ""), shell=True)
+            cmd = f'"{argv[0]}"' + (" " + " ".join(f'"{a}"' if " " in a else a for a in argv[1:]) if len(argv) > 1 else "")
+            subprocess.Popen(cmd, shell=True)
+            logger.info("shell launch OK: %s", spec)
             return True, "shell"
         except Exception as exc2:
             logger.error("launch failed %s: %s", spec, exc2)
@@ -519,32 +529,38 @@ def _launch_executable(spec: str) -> tuple[bool, str]:
 
 
 def _tool_open_app(params: dict[str, Any]) -> str:
-    raw_name = str(params.get("name") or params.get("app") or "").strip()
+    raw_name = str(
+        params.get("name") or params.get("app") or params.get("application") or ""
+    ).strip()
     path = params.get("path")
+    force_app = bool(params.get("force_app") or params.get("force"))
 
     if path:
         ok, detail = _launch_executable(str(path))
         return f"Открываю {Path(str(path)).name}" if ok else f"Не удалось: {detail}"
 
     if not raw_name:
-        apps = ", ".join(sorted(config.APP_PATHS)[:12]) or "настрой в GUI"
+        apps = ", ".join(sorted(config.get_effective_app_paths())[:12]) or "настрой в GUI"
         return f"Приложение не указано. Доступны: {apps}"
 
-    # Сайты и поиск — в браузер, не .exe
-    if not params.get("force_app") and config.should_prefer_browser(raw_name):
+    # Сайты — в браузер; LAUNCH_APP всегда передаёт force_app=True
+    if not force_app and config.should_prefer_browser(raw_name):
         return _tool_open_browser({"query": raw_name})
 
-    app_path, key = config.resolve_app_path(raw_name)
+    app_path, key, source = config.resolve_app_path(raw_name)
     if not app_path:
-        logger.warning("app not found: %r (normalized=%s)", raw_name, config.normalize_app_name(raw_name))
+        norm = config.normalize_app_name(raw_name)
+        logger.warning("app not found: %r (normalized=%s)", raw_name, norm)
+        known = ", ".join(sorted(config.get_effective_app_paths())[:10])
         return (
-            f"Приложение «{raw_name}» не найдено. "
-            f"Добавь в GUI → Приложения. Известны: {', '.join(sorted(config.APP_PATHS)[:8])}"
+            f"Приложение «{raw_name}» не найдено (искали: {norm}). "
+            f"Добавь в GUI → Приложения. Известны: {known}"
         )
 
+    logger.info("LAUNCH_APP resolved: name=%s key=%s source=%s path=%s", raw_name, key, source, app_path)
     ok, detail = _launch_executable(app_path)
     if ok:
-        return f"Запущено: {key} ({detail})"
+        return f"Запущено: {key} [{source}] ({detail})"
     return f"Ошибка запуска {key}: {detail}"
 
 
@@ -770,9 +786,9 @@ def _execute_macro_step(macro_type: str, params: dict[str, Any]) -> str:
 
     if mtype == "LAUNCH_APP":
         return _tool_open_app({
-            "name": p.get("name") or p.get("app") or "",
+            "name": p.get("name") or p.get("app") or p.get("application") or "",
             "path": p.get("path"),
-            "force_app": p.get("force_app"),
+            "force_app": True,
         })
     if mtype == "OPEN_BROWSER":
         return _tool_open_browser(p)
@@ -813,7 +829,7 @@ def _parse_macro(item: Any) -> tuple[str, dict[str, Any]]:
         return "", {}
     if isinstance(item, dict):
         mtype = str(
-            item.get("type") or item.get("action") or item.get("macro") or item.get("name") or ""
+            item.get("type") or item.get("action") or item.get("macro") or ""
         ).strip()
         if not mtype and len(item) == 1:
             mtype = next(iter(item.keys()))
@@ -824,7 +840,9 @@ def _parse_macro(item: Any) -> tuple[str, dict[str, Any]]:
         params = item.get("params") or item.get("arguments") or {}
         if not isinstance(params, dict):
             params = {}
-        flat = {k: v for k, v in item.items() if k not in ("type", "action", "macro", "name", "params", "arguments")}
+        # ВАЖНО: «name» — параметр LAUNCH_APP, не meta-поле (баг v9: name терялся)
+        _meta = frozenset({"type", "action", "macro", "params", "arguments"})
+        flat = {k: v for k, v in item.items() if k not in _meta}
         params = {**flat, **params}
         return _normalize_macro_type(mtype), params
     return "", {}
