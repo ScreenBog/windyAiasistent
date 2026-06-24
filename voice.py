@@ -298,6 +298,7 @@ class ContinuousVAD:
         self.total_t += self.dt
 
         if self.phase == VADPhase.CALIBRATING:
+            self.pre_roll.append(data)  # pre-roll с калибровки — не теряем начало фразы
             if self._calibrate(level):
                 pass
             return False

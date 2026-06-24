@@ -457,8 +457,10 @@ _register()
 def _parse_action(action: Any) -> tuple[str, dict[str, Any]]:
     """
     Универсальный парсер action: brain.Action dataclass или dict.
-    Исправляет AttributeError: Action has no attribute 'get'.
+    Никогда не вызывает action.get() на dataclass — исправляет AttributeError.
     """
+    if action is None:
+        return "", {}
     if isinstance(action, dict):
         tool = str(action.get("tool") or action.get("name") or "").strip().lower()
         params = action.get("params") or action.get("arguments") or {}

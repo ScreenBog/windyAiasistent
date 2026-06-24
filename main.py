@@ -131,6 +131,7 @@ class WindyAssistant:
 
     def reload_settings(self) -> None:
         config.reload_settings()
+        config.validate_app_paths()
         config.ensure_app_paths()
         config.invalidate_app_cache()
         self.voice.reload()

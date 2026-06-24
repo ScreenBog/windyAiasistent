@@ -238,10 +238,31 @@ def _path_exists(spec: str) -> bool:
     return False
 
 
+def validate_app_paths() -> None:
+    """Убрать битые пути и подставить из автоскана."""
+    global APP_PATHS
+    if not APP_PATHS:
+        return
+    scanned = _get_scanned_apps()
+    fixed: dict[str, str] = {}
+    for key, path in APP_PATHS.items():
+        if _path_exists(path):
+            fixed[key] = path
+            continue
+        logger.warning("broken app path %s: %s", key, path)
+        for src in (scanned, DEFAULT_APP_PATHS):
+            if key in src and _path_exists(src[key]):
+                fixed[key] = src[key]
+                logger.info("fixed %s → %s", key, src[key])
+                break
+    APP_PATHS = fixed
+
+
 def ensure_app_paths() -> None:
     """Заполнить APP_PATHS из скана, если settings пуст."""
     global APP_PATHS
     if APP_PATHS:
+        validate_app_paths()
         return
     try:
         import app_scanner
