@@ -99,6 +99,14 @@ WHISPER_COMPUTE_TYPE = "int8"
 WHISPER_LANGUAGE = "ru"
 OLLAMA_HOST = "http://127.0.0.1:11434"
 OLLAMA_MODEL = "qwen2.5:3b-windy"
+OLLAMA_MODEL_FAST = ""              # пусто = OLLAMA_MODEL (быстрые команды)
+OLLAMA_MODEL_SLOW = ""              # пусто = OLLAMA_MODEL (сложные сценарии)
+HYBRID_MODELS_ENABLED = True
+SIMPLE_COMMAND_MAX_WORDS = 6
+LEARNING_ENABLED = True
+LEARNING_AUTO_SCAN = True
+LEARNING_MAX_ENTRIES = 200
+LEARNING_MAX_CORRECTIONS = 50
 OLLAMA_TEMPERATURE = 0.25
 OLLAMA_NUM_CTX = 4096
 OLLAMA_NUM_GPU = -1
@@ -126,7 +134,7 @@ PLUGINS_ENABLED = True
 GUI_THEME = "dark"
 GUI_ACCENT = "#6366f1"
 GUI_ACCENT_HOVER = "#4f46e5"
-GUI_VERSION = "v8.1"
+GUI_VERSION = "v9.0"
 GUI_SUCCESS = "#22c55e"
 GUI_WARNING = "#f59e0b"
 GUI_DANGER = "#ef4444"
@@ -234,6 +242,65 @@ _BROWSER_PREFIXES = (
     "open", "go to", "launch", "включи сайт", "запусти сайт",
 )
 
+# Типы JSON-макросов (генерирует LLM)
+MACRO_TYPES: tuple[str, ...] = (
+    "LAUNCH_APP",
+    "FOCUS",
+    "SHELL_CMD",
+    "KEY",
+    "TYPE",
+    "SLEEP",
+    "OPEN_BROWSER",
+    "TELEGRAM_SEND",
+    "TELEGRAM_READ",
+    "OPEN_VK",
+)
+
+# Запрещённые фрагменты для SHELL_CMD (подстроки, lower case)
+FORBIDDEN_SHELL_PATTERNS: tuple[str, ...] = (
+    "format ",
+    "format c",
+    "del /f",
+    "del /s",
+    "rd /s",
+    "rmdir /s",
+    "remove-item -recurse",
+    "remove-item -force",
+    "shutdown",
+    "restart-computer",
+    "stop-computer",
+    "reg delete",
+    "reg add",
+    "diskpart",
+    "cipher /w",
+    "bcdedit",
+    "takeown",
+    "icacls",
+    "net user",
+    "net localgroup",
+    "wmic process call terminate",
+    ":(){",  # fork bomb
+    "rm -rf",
+    "mkfs",
+    "dd if=",
+    "chmod 777",
+    "> nul &",
+    "invoke-expression",
+    "iex ",
+    "downloadstring",
+    "curl |",
+    "wget |",
+    "start-process powershell -verb runas",
+)
+
+# Полностью запрещённые команды (точное совпадение после strip lower)
+FORBIDDEN_COMMANDS: frozenset[str] = frozenset({
+    "format c:",
+    "format c: /y",
+    "shutdown /s /t 0",
+    "shutdown -s -t 0",
+})
+
 _SEARCH_PREFIXES: tuple[tuple[str, str], ...] = (
     ("поищи в гугле", "google"),
     ("поиск в гугле", "google"),
@@ -333,6 +400,29 @@ def should_prefer_browser(name: str) -> bool:
     if not key:
         return False
     return key in BROWSER_PREFERRED
+
+
+def is_shell_command_allowed(command: str) -> tuple[bool, str]:
+    """Проверка безопасности SHELL_CMD перед выполнением."""
+    cmd = (command or "").strip()
+    if not cmd:
+        return False, "пустая команда"
+    low = cmd.lower()
+    if low in FORBIDDEN_COMMANDS:
+        return False, "команда в чёрном списке"
+    for pattern in FORBIDDEN_SHELL_PATTERNS:
+        if pattern in low:
+            return False, f"запрещённый фрагмент: {pattern.strip()}"
+    return True, ""
+
+
+def resolve_ollama_model(*, complex_task: bool) -> str:
+    """Гибрид: быстрая модель для простых команд, медленная для сложных."""
+    if not HYBRID_MODELS_ENABLED:
+        return OLLAMA_MODEL
+    if complex_task:
+        return OLLAMA_MODEL_SLOW or OLLAMA_MODEL
+    return OLLAMA_MODEL_FAST or OLLAMA_MODEL
 
 
 def is_ambiguous_app_site(name: str) -> bool:
@@ -522,7 +612,10 @@ def _apply_dict(data: dict[str, Any]) -> None:
     global WAKE_WORD, WAKE_WORD_ALIASES, WHISPER_MODEL, WHISPER_DEVICE
     global WHISPER_COMPUTE_TYPE, WHISPER_LANGUAGE, OLLAMA_HOST, OLLAMA_MODEL
     global OLLAMA_TEMPERATURE, OLLAMA_NUM_CTX, OLLAMA_NUM_GPU, OLLAMA_TOP_P
-    global OLLAMA_REPEAT_PENALTY, TTS_VOICE, TTS_RATE, TTS_VOLUME
+    global OLLAMA_REPEAT_PENALTY, OLLAMA_MODEL_FAST, OLLAMA_MODEL_SLOW
+    global HYBRID_MODELS_ENABLED, SIMPLE_COMMAND_MAX_WORDS
+    global LEARNING_ENABLED, LEARNING_AUTO_SCAN, LEARNING_MAX_ENTRIES, LEARNING_MAX_CORRECTIONS
+    global TTS_VOICE, TTS_RATE, TTS_VOLUME
     global VAD_SENSITIVITY, VAD_SPEECH_THRESHOLD, VAD_SILENCE_THRESHOLD
     global VAD_SILENCE_SEC, VAD_RELEASE_SEC, VAD_HANGOVER_SEC, VAD_MAX_RECORD_SEC
     global VAD_MIN_SPEECH_SEC, VAD_WAIT_SPEECH_SEC, VAD_PRE_ROLL_SEC
@@ -554,6 +647,14 @@ def _apply_dict(data: dict[str, Any]) -> None:
     WHISPER_LANGUAGE = str(data.get("whisper_language", WHISPER_LANGUAGE))
     OLLAMA_HOST = str(data.get("ollama_host", OLLAMA_HOST))
     OLLAMA_MODEL = str(data.get("ollama_model", OLLAMA_MODEL))
+    OLLAMA_MODEL_FAST = str(data.get("ollama_model_fast", OLLAMA_MODEL_FAST))
+    OLLAMA_MODEL_SLOW = str(data.get("ollama_model_slow", OLLAMA_MODEL_SLOW))
+    HYBRID_MODELS_ENABLED = bool(data.get("hybrid_models_enabled", HYBRID_MODELS_ENABLED))
+    SIMPLE_COMMAND_MAX_WORDS = int(data.get("simple_command_max_words", SIMPLE_COMMAND_MAX_WORDS) or 6)
+    LEARNING_ENABLED = bool(data.get("learning_enabled", LEARNING_ENABLED))
+    LEARNING_AUTO_SCAN = bool(data.get("learning_auto_scan", LEARNING_AUTO_SCAN))
+    LEARNING_MAX_ENTRIES = int(data.get("learning_max_entries", LEARNING_MAX_ENTRIES) or 200)
+    LEARNING_MAX_CORRECTIONS = int(data.get("learning_max_corrections", LEARNING_MAX_CORRECTIONS) or 50)
     OLLAMA_TEMPERATURE = float(data.get("ollama_temperature", OLLAMA_TEMPERATURE))
     OLLAMA_NUM_CTX = int(data.get("ollama_num_ctx", OLLAMA_NUM_CTX))
     OLLAMA_NUM_GPU = int(data.get("ollama_num_gpu", OLLAMA_NUM_GPU))
@@ -630,6 +731,14 @@ def to_dict() -> dict[str, Any]:
         "whisper_language": WHISPER_LANGUAGE,
         "ollama_host": OLLAMA_HOST,
         "ollama_model": OLLAMA_MODEL,
+        "ollama_model_fast": OLLAMA_MODEL_FAST,
+        "ollama_model_slow": OLLAMA_MODEL_SLOW,
+        "hybrid_models_enabled": HYBRID_MODELS_ENABLED,
+        "simple_command_max_words": SIMPLE_COMMAND_MAX_WORDS,
+        "learning_enabled": LEARNING_ENABLED,
+        "learning_auto_scan": LEARNING_AUTO_SCAN,
+        "learning_max_entries": LEARNING_MAX_ENTRIES,
+        "learning_max_corrections": LEARNING_MAX_CORRECTIONS,
         "ollama_temperature": OLLAMA_TEMPERATURE,
         "ollama_num_ctx": OLLAMA_NUM_CTX,
         "ollama_num_gpu": OLLAMA_NUM_GPU,

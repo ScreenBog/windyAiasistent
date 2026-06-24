@@ -1,14 +1,14 @@
 """
-История команд ассистента (для GUI и отладки).
+История команд ассистента (для GUI, обучения и отладки).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections import deque
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import bootstrap  # noqa: F401
@@ -31,11 +31,24 @@ def load_history() -> None:
         logger.warning("history load: %s", exc)
 
 
-def add_entry(command: str, response: str) -> None:
+def add_entry(
+    command: str,
+    response: str,
+    *,
+    macros: list | None = None,
+    model: str = "",
+    entry_id: str | None = None,
+) -> str:
+    eid = entry_id or uuid.uuid4().hex[:12]
     entry = {
+        "id": eid,
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "command": command[:500],
         "response": response[:500],
+        "macros": macros or [],
+        "model": model,
+        "wrong": False,
+        "feedback": "",
     }
     _buffer.append(entry)
     try:
@@ -45,6 +58,37 @@ def add_entry(command: str, response: str) -> None:
         )
     except Exception as exc:
         logger.warning("history save: %s", exc)
+
+    if config.LEARNING_ENABLED:
+        try:
+            import learning
+            learning.record_command(command, response, macros=macros, model=model)
+        except Exception as exc:
+            logger.debug("learning record: %s", exc)
+
+    return eid
+
+
+def mark_last_wrong(command: str, feedback: str = "") -> bool:
+    """Пометить последнюю запись с такой командой как неверную."""
+    norm = command.strip().lower()
+    for entry in reversed(_buffer):
+        if entry.get("command", "").strip().lower() == norm or not norm:
+            entry["wrong"] = True
+            entry["feedback"] = feedback[:300]
+            try:
+                HISTORY_PATH.write_text(
+                    json.dumps(list(_buffer), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as exc:
+                logger.warning("history mark save: %s", exc)
+            return True
+    return False
+
+
+def get_last_entry() -> dict[str, Any] | None:
+    return _buffer[-1] if _buffer else None
 
 
 def get_history(limit: int = 20) -> list[dict[str, Any]]:

@@ -1,11 +1,10 @@
 """
-Мозг Windy: Ollama + строгий JSON tool calling.
+Мозг Windy: Ollama + JSON-макросы + гибрид моделей.
 
-Гарантии:
-  - format="json" в Ollama
-  - Парсинг с извлечением JSON из markdown
-  - Валидация схемы (speech + actions)
-  - Retry при невалидном ответе
+Формат ответа LLM:
+  {"speech": "...", "macros": [{"type": "OPEN_BROWSER", "query": "грок"}, ...]}
+
+Поддерживается legacy: {"speech": "...", "actions": [{"tool": "...", "params": {}}]}
 """
 
 from __future__ import annotations
@@ -18,12 +17,23 @@ from typing import Any
 
 import bootstrap  # noqa: F401
 import config
-from tools import TOOL_REGISTRY
 
 logger = logging.getLogger(__name__)
 
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 _JSON_OBJECT = re.compile(r"(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})", re.DOTALL)
+
+_COMPLEX_MARKERS = (
+    " и ", " потом ", " затем ", " после ", " сначала ",
+    "прочитай", "напиши", "отправь", "найди", "поищи",
+    "несколько", "пошаг", "макрос", "скрипт",
+)
+
+
+@dataclass
+class Macro:
+    type: str
+    params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -35,37 +45,52 @@ class Action:
 @dataclass
 class BrainResponse:
     speech: str = ""
+    macros: list[Macro] = field(default_factory=list)
     actions: list[Action] = field(default_factory=list)
     raw: str = ""
+    model_used: str = ""
+
+    @property
+    def has_macros(self) -> bool:
+        return bool(self.macros)
 
     @property
     def has_actions(self) -> bool:
-        return bool(self.actions)
+        return bool(self.macros or self.actions)
+
+    def macros_as_dicts(self) -> list[dict[str, Any]]:
+        return [{"type": m.type, **m.params} for m in self.macros]
 
 
 def _load_prompt() -> str:
     try:
         text = config.SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+        hints = ""
+        if config.LEARNING_ENABLED:
+            try:
+                import learning
+                hints = learning.get_prompt_hints()
+            except Exception:
+                pass
         return (
             text.replace("{{APPS}}", ", ".join(sorted(config.APP_PATHS)) or "chrome, telegram")
             .replace("{{GAMES}}", ", ".join(f"{k}:{v}" for k, v in config.STEAM_GAMES.items()) or "-")
-            .replace("{{TOOLS}}", ", ".join(sorted(TOOL_REGISTRY.keys())))
+            .replace("{{MACROS}}", ", ".join(config.MACRO_TYPES))
+            .replace("{{LEARNING}}", hints or "нет исправлений")
         )
     except FileNotFoundError:
         logger.warning("system prompt not found")
-        return '{"speech":"...","actions":[]}'
+        return '{"speech":"...","macros":[]}'
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:
     if not text:
         return None
     text = text.strip()
-
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-
     for pattern in (_JSON_BLOCK, _JSON_OBJECT):
         for match in pattern.finditer(text):
             try:
@@ -75,8 +100,22 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     return None
 
 
+def is_complex_command(text: str) -> bool:
+    """Эвристика: сложная команда → медленная модель."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    words = t.split()
+    if len(words) > config.SIMPLE_COMMAND_MAX_WORDS:
+        return True
+    if any(m in t for m in _COMPLEX_MARKERS):
+        return True
+    if t.count(",") >= 2:
+        return True
+    return False
+
+
 def _validate_response(data: dict[str, Any]) -> tuple[bool, str]:
-    """Проверка минимальной схемы JSON-ответа."""
     if not isinstance(data, dict):
         return False, "root not object"
 
@@ -84,30 +123,55 @@ def _validate_response(data: dict[str, Any]) -> tuple[bool, str]:
     if speech is not None and not isinstance(speech, str):
         return False, "speech must be string"
 
+    macros = data.get("macros")
     actions = data.get("actions")
-    if actions is None:
-        return True, ""
-    if not isinstance(actions, list):
-        return False, "actions must be array"
 
-    for i, item in enumerate(actions):
-        if not isinstance(item, dict):
-            return False, f"action[{i}] not object"
-        tool = item.get("tool") or item.get("name")
-        if not tool or not isinstance(tool, str):
-            return False, f"action[{i}] missing tool"
-        params = item.get("params") or item.get("arguments") or {}
-        if not isinstance(params, dict):
-            return False, f"action[{i}] params not object"
+    if macros is None and actions is None:
+        return True, ""
+
+    if macros is not None:
+        if not isinstance(macros, list):
+            return False, "macros must be array"
+        for i, item in enumerate(macros):
+            if not isinstance(item, dict):
+                return False, f"macro[{i}] not object"
+            mtype = item.get("type") or item.get("action") or item.get("macro")
+            if not mtype and len(item) != 1:
+                return False, f"macro[{i}] missing type"
+
+    if actions is not None:
+        if not isinstance(actions, list):
+            return False, "actions must be array"
+        for i, item in enumerate(actions):
+            if not isinstance(item, dict):
+                return False, f"action[{i}] not object"
+            tool = item.get("tool") or item.get("name")
+            if not tool:
+                return False, f"action[{i}] missing tool"
 
     return True, ""
+
+
+def _parse_macros(data: dict[str, Any]) -> list[Macro]:
+    from tools import _parse_macro
+
+    raw = data.get("macros") or []
+    if isinstance(raw, dict):
+        raw = [raw]
+    out: list[Macro] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        mtype, params = _parse_macro(item)
+        if mtype:
+            out.append(Macro(type=mtype, params=params))
+    return out
 
 
 def _parse_actions(data: dict[str, Any]) -> list[Action]:
     raw = data.get("actions") or []
     if isinstance(raw, dict):
         raw = [raw]
-
     out: list[Action] = []
     for item in raw:
         if not isinstance(item, dict):
@@ -134,6 +198,38 @@ def _ollama_options() -> dict[str, Any]:
     return opts
 
 
+def _fast_path_macros(text: str) -> BrainResponse | None:
+    """Мгновенный ответ без LLM для частых шаблонов."""
+    import config as cfg
+
+    t = cfg.normalize_browser_query(text)
+    if not t:
+        return None
+
+    if t in ("вк", "вконтакте", "vk"):
+        return BrainResponse(
+            speech="Открываю ВКонтакте.",
+            macros=[Macro("OPEN_VK", {})],
+            model_used="fast-path",
+        )
+    if t in cfg.BROWSER_SITES and cfg.should_prefer_browser(t):
+        return BrainResponse(
+            speech=f"Открываю {t}.",
+            macros=[Macro("OPEN_BROWSER", {"query": t})],
+            model_used="fast-path",
+        )
+    for prefix, _engine in cfg._SEARCH_PREFIXES:
+        if t.startswith(prefix + " "):
+            term = t[len(prefix) + 1 :].strip()
+            if term:
+                return BrainResponse(
+                    speech="Ищу в интернете.",
+                    macros=[Macro("OPEN_BROWSER", {"query": text.strip()})],
+                    model_used="fast-path",
+                )
+    return None
+
+
 class Brain:
     def __init__(self) -> None:
         self.model = config.OLLAMA_MODEL
@@ -141,6 +237,8 @@ class Brain:
         self.system_prompt = _load_prompt()
         self._history: list[dict[str, str]] = []
         self._client = None
+        self._last_command = ""
+        self._last_response: BrainResponse | None = None
 
     def _client_get(self):
         if self._client is None:
@@ -156,21 +254,24 @@ class Brain:
             self.host = config.OLLAMA_HOST
             self._client = None
 
-    def _chat_once(self, user_text: str, strict_hint: bool = False) -> str:
+    @property
+    def last_response(self) -> BrainResponse | None:
+        return self._last_response
+
+    def _chat_once(self, user_text: str, *, model: str, strict_hint: bool = False) -> str:
         hint = ""
         if strict_hint:
             hint = (
-                "\n\nВАЖНО: ответь ТОЛЬКО валидным JSON "
-                '{"speech":"...","actions":[{"tool":"...","params":{}}]} без markdown.'
+                '\n\nВАЖНО: ответь ТОЛЬКО валидным JSON '
+                '{"speech":"...","macros":[{"type":"OPEN_BROWSER","query":"..."}]} без markdown.'
             )
-
         messages = [
             {"role": "system", "content": self.system_prompt},
             *self._history[-16:],
             {"role": "user", "content": user_text + hint},
         ]
         resp = self._client_get().chat(
-            model=self.model,
+            model=model,
             messages=messages,
             options=_ollama_options(),
             format="json",
@@ -182,12 +283,25 @@ class Brain:
         if not text:
             return BrainResponse(speech=config.NO_SPEECH)
 
+        self._last_command = text
+
+        # Fast-path для простых команд (без Ollama)
+        if config.HYBRID_MODELS_ENABLED:
+            fp = _fast_path_macros(text)
+            if fp and not is_complex_command(text):
+                self._last_response = fp
+                return fp
+
+        complex_task = is_complex_command(text)
+        model = config.resolve_ollama_model(complex_task=complex_task)
+        logger.info("brain model=%s complex=%s", model, complex_task)
+
         last_raw = ""
         last_error = ""
 
         for attempt in range(config.OLLAMA_JSON_RETRIES + 1):
             try:
-                raw = self._chat_once(text, strict_hint=(attempt > 0))
+                raw = self._chat_once(text, model=model, strict_hint=(attempt > 0))
                 last_raw = raw
                 data = _extract_json(raw)
                 if not data:
@@ -202,6 +316,7 @@ class Brain:
                     continue
 
                 speech = str(data.get("speech") or data.get("response") or "").strip()
+                macros = _parse_macros(data)
                 actions = _parse_actions(data)
 
                 self._history += [
@@ -209,7 +324,16 @@ class Brain:
                     {"role": "assistant", "content": raw},
                 ]
                 self._history = self._history[-20:]
-                return BrainResponse(speech=speech, actions=actions, raw=raw)
+
+                resp = BrainResponse(
+                    speech=speech,
+                    macros=macros,
+                    actions=actions,
+                    raw=raw,
+                    model_used=model,
+                )
+                self._last_response = resp
+                return resp
 
             except Exception as exc:
                 last_error = str(exc)
@@ -227,8 +351,13 @@ class Brain:
         try:
             models = self._client_get().list().get("models", [])
             names = {m.get("model", m.get("name", "")) for m in models}
-            target = self.model.split(":")[0]
-            return any(target in n for n in names)
+            for candidate in (config.OLLAMA_MODEL, config.OLLAMA_MODEL_FAST, config.OLLAMA_MODEL_SLOW):
+                if not candidate:
+                    continue
+                target = candidate.split(":")[0]
+                if any(target in n for n in names):
+                    return True
+            return False
         except Exception as exc:
             logger.error("Ollama check: %s", exc)
             return False

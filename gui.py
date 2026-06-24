@@ -1,5 +1,5 @@
 """
-Windy AI Assistant v8.1 — современный GUI (CustomTkinter).
+Windy AI Assistant v9.0 — современный GUI (CustomTkinter).
 
 Страницы:
   - Главная: wake-word, VAD, быстрая команда
@@ -310,6 +310,11 @@ class WindyGUI(ctk.CTk):
         self.entry_cmd.pack(side="left", padx=(0, 8))
         self.entry_cmd.bind("<Return>", lambda _e: self._send_text())
         ctk.CTkButton(row, text="Отправить", width=110, height=38, fg_color=Theme.ACCENT, command=self._send_text).pack(side="left")
+        ctk.CTkButton(
+            row, text="✗ Неверно", width=100, height=38,
+            fg_color=Theme.DANGER, hover_color="#dc2626",
+            command=self._mark_wrong,
+        ).pack(side="left", padx=(8, 0))
 
         sites_row = ctk.CTkFrame(cmd_card, fg_color="transparent")
         sites_row.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
@@ -1005,7 +1010,15 @@ class WindyGUI(ctk.CTk):
     def _refresh_history(self) -> None:
         self.txt_hist.delete("1.0", "end")
         for entry in history.get_history(30):
-            self.txt_hist.insert("end", f"▸ {entry['time']}\n  {entry['command']}\n  ↳ {entry['response'][:140]}\n\n")
+            wrong = " [НЕВЕРНО]" if entry.get("wrong") else ""
+            model = entry.get("model", "")
+            model_tag = f" ({model})" if model else ""
+            self.txt_hist.insert(
+                "end",
+                f"▸ {entry['time']}{wrong}{model_tag}\n"
+                f"  {entry['command']}\n"
+                f"  ↳ {entry['response'][:140]}\n\n",
+            )
 
     def _run_tool_result(self, tool: str, params: dict, title: str) -> None:
         r = self.assistant.tools.execute(tool, params)
@@ -1083,9 +1096,25 @@ class WindyGUI(ctk.CTk):
             threading.Thread(target=lambda: self._run_cmd(text), daemon=True).start()
 
     def _run_cmd(self, text: str) -> None:
-        r = self.assistant.process_command(text)
-        history.add_entry(text, r)
+        self.assistant.process_command(text)
         self.after(0, self._refresh_history)
+
+    def _mark_wrong(self) -> None:
+        feedback = simpledialog.askstring(
+            "Пометить как неверно",
+            "Что было не так? (необязательно)",
+            parent=self,
+        )
+        if feedback is None:
+            return
+
+        def _work():
+            msg = self.assistant.mark_last_wrong(feedback or "")
+            self.after(0, lambda: self._append_log(f"[learn] {msg}"))
+            self.after(0, self._refresh_history)
+            self.after(0, lambda: messagebox.showinfo("Обучение", msg))
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _close(self) -> None:
         if self._pulse_job:

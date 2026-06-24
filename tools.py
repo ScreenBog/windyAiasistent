@@ -616,6 +616,10 @@ def _tool_run_command(params: dict[str, Any]) -> str:
     cmd = str(params.get("command") or params.get("cmd") or "").strip()
     if not cmd:
         return "Команда пуста"
+    ok, reason = config.is_shell_command_allowed(cmd)
+    if not ok:
+        logger.warning("blocked shell: %s — %s", cmd[:80], reason)
+        return f"Команда заблокирована: {reason}"
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=45)
         out = (r.stdout or r.stderr or "").strip()
@@ -672,6 +676,210 @@ def _register() -> None:
 _register()
 
 
+# ── JSON-макросы ──────────────────────────────────────────────────────────────
+
+MACRO_ALIASES: dict[str, str] = {
+    "launch_app": "LAUNCH_APP",
+    "open_app": "LAUNCH_APP",
+    "open_browser": "OPEN_BROWSER",
+    "browser": "OPEN_BROWSER",
+    "shell_cmd": "SHELL_CMD",
+    "run_command": "SHELL_CMD",
+    "key": "KEY",
+    "type": "TYPE",
+    "type_text": "TYPE",
+    "sleep": "SLEEP",
+    "focus": "FOCUS",
+    "telegram_send": "TELEGRAM_SEND",
+    "telegram_send_message": "TELEGRAM_SEND",
+    "telegram_read": "TELEGRAM_READ",
+    "telegram_read_last": "TELEGRAM_READ",
+    "open_vk": "OPEN_VK",
+}
+
+
+def _normalize_macro_type(raw: str) -> str:
+    t = (raw or "").strip().upper().replace("-", "_")
+    return MACRO_ALIASES.get(t.lower(), t)
+
+
+def _macro_focus_window(title: str) -> str:
+    """Переключиться на окно по подстроке заголовка (Win32 API)."""
+    import ctypes
+    from ctypes import wintypes
+
+    needle = (title or "").strip().lower()
+    if not needle:
+        return "FOCUS: заголовок окна пуст"
+
+    user32 = ctypes.windll.user32
+    found_hwnd: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_cb(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buff = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buff, length + 1)
+        if needle in buff.value.lower():
+            found_hwnd.append(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(_enum_cb, 0)
+    if not found_hwnd:
+        return f"Окно «{title}» не найдено"
+    hwnd = found_hwnd[0]
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.SetForegroundWindow(hwnd)
+    return f"Фокус: {title}"
+
+
+def _macro_key(params: dict[str, Any]) -> str:
+    import pyautogui
+    key = str(params.get("key") or params.get("keys") or "").strip().lower()
+    if not key:
+        return "KEY: клавиша не указана"
+    mods = params.get("modifiers") or params.get("mods") or []
+    if isinstance(mods, str):
+        mods = [m.strip() for m in mods.split("+") if m.strip()]
+    if mods:
+        pyautogui.hotkey(*[str(m).lower() for m in mods], key)
+    else:
+        pyautogui.press(key)
+    return f"KEY: {key}"
+
+
+def _macro_sleep(params: dict[str, Any]) -> str:
+    if params.get("ms") is not None:
+        sec = float(params["ms"]) / 1000.0
+    else:
+        sec = float(params.get("seconds") or params.get("sec") or 1.0)
+    sec = max(0.0, min(sec, 30.0))
+    time.sleep(sec)
+    return f"SLEEP: {sec:.1f}s"
+
+
+def _execute_macro_step(macro_type: str, params: dict[str, Any]) -> str:
+    """Выполнить один шаг JSON-макроса."""
+    mtype = _normalize_macro_type(macro_type)
+    p = params or {}
+
+    if mtype == "LAUNCH_APP":
+        return _tool_open_app({
+            "name": p.get("name") or p.get("app") or "",
+            "path": p.get("path"),
+            "force_app": p.get("force_app"),
+        })
+    if mtype == "OPEN_BROWSER":
+        return _tool_open_browser(p)
+    if mtype == "OPEN_VK":
+        return _tool_open_vk(p)
+    if mtype == "SHELL_CMD":
+        return _tool_run_command({"command": p.get("command") or p.get("cmd") or ""})
+    if mtype == "TYPE":
+        return _tool_type_text({
+            "text": p.get("text") or p.get("value") or "",
+            "wait": p.get("wait", 0.3),
+        })
+    if mtype == "KEY":
+        return _macro_key(p)
+    if mtype == "SLEEP":
+        return _macro_sleep(p)
+    if mtype == "FOCUS":
+        return _macro_focus_window(str(p.get("title") or p.get("window") or p.get("name") or ""))
+    if mtype == "TELEGRAM_SEND":
+        return _tool_telegram_send_message(p)
+    if mtype == "TELEGRAM_READ":
+        return _tool_telegram_read_last(p)
+
+    # Legacy tool name внутри макроса TOOL
+    if mtype == "TOOL":
+        tool = str(p.get("tool") or p.get("name") or "").strip().lower()
+        inner = p.get("params") or {k: v for k, v in p.items() if k not in ("tool", "name", "type")}
+        if tool in TOOL_REGISTRY:
+            return _safe_call(TOOL_REGISTRY[tool], inner if isinstance(inner, dict) else {}, tool)
+        return f"Неизвестный TOOL: {tool}"
+
+    return f"Неизвестный макрос: {macro_type}"
+
+
+def _parse_macro(item: Any) -> tuple[str, dict[str, Any]]:
+    """Парсинг одного макроса: dict с type/params или плоский формат."""
+    if item is None:
+        return "", {}
+    if isinstance(item, dict):
+        mtype = str(
+            item.get("type") or item.get("action") or item.get("macro") or item.get("name") or ""
+        ).strip()
+        if not mtype and len(item) == 1:
+            mtype = next(iter(item.keys()))
+            val = item[mtype]
+            if isinstance(val, dict):
+                return _normalize_macro_type(str(mtype)), val
+            return _normalize_macro_type(str(mtype)), {"value": val}
+        params = item.get("params") or item.get("arguments") or {}
+        if not isinstance(params, dict):
+            params = {}
+        flat = {k: v for k, v in item.items() if k not in ("type", "action", "macro", "name", "params", "arguments")}
+        params = {**flat, **params}
+        return _normalize_macro_type(mtype), params
+    return "", {}
+
+
+class MacroExecutor:
+    """Исполнитель JSON-массива макросов от LLM."""
+
+    def execute(self, macro_type: str, params: dict[str, Any] | None = None) -> str:
+        return _safe_call(
+            lambda p: _execute_macro_step(macro_type, p),
+            params or {},
+            macro_type,
+        )
+
+    def execute_all(self, macros: list) -> list[str]:
+        results: list[str] = []
+        for i, item in enumerate(macros):
+            try:
+                mtype, params = _parse_macro(item)
+                if not mtype:
+                    results.append(f"macro[{i}]: пустой type")
+                    continue
+                logger.info("execute macro=%s params=%s", mtype, params)
+                results.append(self.execute(mtype, params))
+            except Exception as exc:
+                logger.error("macro[%d]: %s", i, exc, exc_info=True)
+                results.append(f"Ошибка macro[{i}]: {exc}")
+        return results
+
+
+def actions_to_macros(actions: list) -> list[dict[str, Any]]:
+    """Конвертация legacy actions → macros для обратной совместимости."""
+    out: list[dict[str, Any]] = []
+    tool_to_macro = {
+        "open_app": "LAUNCH_APP",
+        "open_browser": "OPEN_BROWSER",
+        "open_vk": "OPEN_VK",
+        "run_command": "SHELL_CMD",
+        "type_text": "TYPE",
+        "telegram_send_message": "TELEGRAM_SEND",
+        "telegram_read_last": "TELEGRAM_READ",
+    }
+    for action in actions:
+        tool, params = _parse_action(action)
+        if not tool:
+            continue
+        mtype = tool_to_macro.get(tool, "TOOL")
+        if mtype == "TOOL":
+            out.append({"type": "TOOL", "tool": tool, "params": params})
+        else:
+            out.append({"type": mtype, **params})
+    return out
+
+
 def _parse_action(action: Any) -> tuple[str, dict[str, Any]]:
     """
     Универсальный парсер action: brain.Action dataclass или dict.
@@ -696,8 +904,11 @@ def _parse_action(action: Any) -> tuple[str, dict[str, Any]]:
 
 
 class ToolExecutor:
+    """Legacy tool registry + делегирование macros."""
+
     def __init__(self, registry: dict[str, ToolHandler] | None = None) -> None:
         self.registry = registry or TOOL_REGISTRY
+        self.macros = MacroExecutor()
 
     def execute(self, tool: str, params: dict[str, Any] | None = None) -> str:
         tool = (tool or "").strip().lower()
@@ -720,6 +931,17 @@ class ToolExecutor:
                 logger.error("execute_all[%d]: %s", i, exc, exc_info=True)
                 results.append(f"Ошибка action[{i}]: {exc}")
         return results
+
+    def execute_macros(self, macros: list) -> list[str]:
+        return self.macros.execute_all(macros)
+
+    def execute_response(self, *, macros: list | None = None, actions: list | None = None) -> list[str]:
+        """Приоритет: macros → legacy actions."""
+        if macros:
+            return self.execute_macros(macros)
+        if actions:
+            return self.execute_macros(actions_to_macros(actions))
+        return []
 
     def list_tools(self) -> list[str]:
         return sorted(set(TOOL_REGISTRY))

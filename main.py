@@ -19,6 +19,7 @@ bootstrap.ensure_project_path()
 
 import config
 import history
+import learning
 import reminders
 from brain import Brain
 from plugin_manager import load_plugins
@@ -85,6 +86,8 @@ class WindyAssistant:
         self._thread: threading.Thread | None = None
         self._status_cb: Callable[[str], None] | None = None
         self._force_lock = threading.Lock()
+        self._last_command = ""
+        self._last_entry_id = ""
 
         plugins = load_plugins()
         if plugins:
@@ -92,6 +95,9 @@ class WindyAssistant:
 
         reminders.set_reminder_callback(lambda msg: self.voice.speak(msg))
         reminders.start_reminder_service()
+
+        if config.LEARNING_ENABLED and config.LEARNING_AUTO_SCAN:
+            learning.scan_apps_async(on_done=lambda _: learning.merge_scanned_into_config())
 
     def on_status(self, cb: Callable[[str], None] | None) -> None:
         self._status_cb = cb
@@ -145,10 +151,12 @@ class WindyAssistant:
 
     def startup(self, speak: bool = True) -> None:
         logger.info(
-            "Windy start | whisper=%s/%s | ollama=%s | vad=%.2f release=%.1fs pre=%.1fs | apps=%d | sites=%d",
-            config.WHISPER_MODEL, config.WHISPER_DEVICE, config.OLLAMA_MODEL,
-            config.VAD_SENSITIVITY, config.vad_release_sec(),
-            config.VAD_PRE_ROLL_SEC, len(config.APP_PATHS), len(config.BROWSER_SITES),
+            "Windy v%s | whisper=%s/%s | ollama=%s fast=%s slow=%s | hybrid=%s | apps=%d sites=%d",
+            config.GUI_VERSION,
+            config.WHISPER_MODEL, config.WHISPER_DEVICE,
+            config.OLLAMA_MODEL, config.OLLAMA_MODEL_FAST or "-", config.OLLAMA_MODEL_SLOW or "-",
+            config.HYBRID_MODELS_ENABLED,
+            len(config.APP_PATHS), len(config.BROWSER_SITES),
         )
         if not self.brain.check_connection():
             logger.warning("Ollama unavailable — запусти ollama serve")
@@ -192,12 +200,15 @@ class WindyAssistant:
         if response.has_actions:
             self._set_status("выполняю...")
             try:
-                tool_results = self.tools.execute_all(response.actions)
+                tool_results = self.tools.execute_response(
+                    macros=response.macros_as_dicts() if response.macros else None,
+                    actions=response.actions if response.actions and not response.macros else None,
+                )
             except Exception as exc:
-                logger.error("tools.execute_all: %s", exc, exc_info=True)
+                logger.error("tools.execute_response: %s", exc, exc_info=True)
                 tool_results = [config.ERROR_GENERIC]
             for r in tool_results:
-                logger.info("tool result: %s", r[:200])
+                logger.info("macro result: %s", r[:200])
 
         speech = response.speech.strip() or ". ".join(tool_results) or "Готово."
         if speak:
@@ -207,9 +218,23 @@ class WindyAssistant:
             except Exception as exc:
                 logger.error("TTS error: %s", exc)
 
-        history.add_entry(clean, speech)
+        self._last_command = clean
+        macros_log = response.macros_as_dicts() if response.macros else []
+        self._last_entry_id = history.add_entry(
+            clean, speech, macros=macros_log, model=response.model_used,
+        )
         self._set_status("слушаю...")
         return speech
+
+    def mark_last_wrong(self, feedback: str = "") -> str:
+        """Пометить последний ответ как неверный (обучение)."""
+        cmd = self._last_command or (history.get_last_entry() or {}).get("command", "")
+        if not cmd:
+            return "Нет последней команды"
+        history.mark_last_wrong(cmd, feedback)
+        if config.LEARNING_ENABLED:
+            return learning.mark_wrong(cmd, feedback=feedback, entry_id=self._last_entry_id)
+        return "Помечено как неверное"
 
     def run_once(self) -> None:
         if self._stop.is_set():
