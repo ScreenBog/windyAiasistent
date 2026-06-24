@@ -240,6 +240,7 @@ class WindyGUI(ctk.CTk):
             if btn:
                 btn.set_active(pid == page_id)
         if page_id == "telegram":
+            self._refresh_tg_auth_status()
             self._refresh_tg_dialogs_async()
 
     # ── Home ──────────────────────────────────────────────────────────────────
@@ -364,7 +365,12 @@ class WindyGUI(ctk.CTk):
 
         ctk.CTkLabel(lf, text="Telegram", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", pady=(0, 4))
         self.lbl_tg_status = ctk.CTkLabel(lf, text="Статус: —", text_color=Theme.MUTED, font=ctk.CTkFont(size=12))
-        self.lbl_tg_status.pack(anchor="w", pady=(0, 12))
+        self.lbl_tg_status.pack(anchor="w", pady=(0, 4))
+        self.lbl_tg_auth = ctk.CTkLabel(
+            lf, text="Авторизация: проверка…", text_color=Theme.MUTED,
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.lbl_tg_auth.pack(anchor="w", pady=(0, 12))
 
         ctk.CTkLabel(lf, text="API ID", font=ctk.CTkFont(size=11), text_color=Theme.MUTED).pack(anchor="w")
         self.e_api_id = ctk.CTkEntry(lf, height=36)
@@ -395,7 +401,10 @@ class WindyGUI(ctk.CTk):
         ctk.CTkLabel(lf, text="Авторизация", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w")
         ctk.CTkLabel(lf, text="1. Сохрани API → 2. Отправить код → 3. Ввести код", text_color=Theme.MUTED, font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(2, 8))
 
-        ctk.CTkButton(lf, text="📲 Отправить код", height=36, fg_color=Theme.TG_BLUE, command=self._tg_send_code).pack(fill="x", pady=4)
+        self.btn_tg_send_code = ctk.CTkButton(
+            lf, text="📲 Отправить код", height=36, fg_color=Theme.TG_BLUE, command=self._tg_send_code,
+        )
+        self.btn_tg_send_code.pack(fill="x", pady=4)
 
         ctk.CTkLabel(lf, text="Код из Telegram", font=ctk.CTkFont(size=11), text_color=Theme.MUTED).pack(anchor="w", pady=(8, 0))
         self.e_tg_code = ctk.CTkEntry(lf, placeholder_text="12345", height=36)
@@ -405,7 +414,10 @@ class WindyGUI(ctk.CTk):
         self.e_tg_2fa = ctk.CTkEntry(lf, placeholder_text="опционально", height=36, show="•")
         self.e_tg_2fa.pack(fill="x", pady=(2, 8))
 
-        ctk.CTkButton(lf, text="🔐 Войти", height=36, fg_color=Theme.SUCCESS, command=self._tg_sign_in).pack(fill="x")
+        self.btn_tg_sign_in = ctk.CTkButton(
+            lf, text="🔐 Войти", height=36, fg_color=Theme.SUCCESS, command=self._tg_sign_in,
+        )
+        self.btn_tg_sign_in.pack(fill="x")
 
         # Правая колонка — чтение/отправка
         right = ctk.CTkFrame(parent, fg_color=Theme.SURFACE, corner_radius=14, border_width=1, border_color=Theme.BORDER)
@@ -723,13 +735,46 @@ class WindyGUI(ctk.CTk):
 
         threading.Thread(target=_work, daemon=True).start()
 
-    def _save_tg(self) -> None:
+    def _set_tg_auth_badge(self, state: str, message: str, ok: bool | None = None) -> None:
+        colors = {
+            "authorized": Theme.SUCCESS,
+            "code_sent": Theme.WARNING,
+            "ready": Theme.WAKE_IDLE,
+            "not_configured": Theme.MUTED,
+            "error": Theme.DANGER,
+        }
+        icons = {
+            "authorized": "✓",
+            "code_sent": "⏳",
+            "ready": "○",
+            "not_configured": "—",
+            "error": "✗",
+        }
+        color = colors.get(state, Theme.MUTED)
+        icon = icons.get(state, "•")
+        self.lbl_tg_auth.configure(text=f"{icon} {message}", text_color=color)
+        if ok is not None:
+            self.pill_telegram.set(ok, message[:32])
+
+    def _refresh_tg_auth_status(self) -> None:
+        def _work():
+            try:
+                import telegram_client as tg
+                st = tg.get_auth_status()
+                self.after(0, lambda: self._set_tg_auth_badge(st["state"], st["message"], st.get("ok")))
+                self.after(0, lambda: self.lbl_tg_status.configure(text=f"Telegram: {st['message']}"))
+            except Exception as exc:
+                self.after(0, lambda: self._set_tg_auth_badge("error", str(exc)[:80], False))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _save_tg(self, *, silent: bool = False) -> bool:
         data = config.to_dict()
         try:
             data["telegram_api_id"] = int(self.e_api_id.get() or 0)
         except ValueError:
             messagebox.showerror("", "API ID — число")
-            return
+            return False
         data["telegram_api_hash"] = self.e_api_hash.get().strip()
         data["telegram_phone"] = self.e_phone.get().strip()
         data["telegram_default_contact"] = self.e_default_contact.get().strip()
@@ -740,20 +785,37 @@ class WindyGUI(ctk.CTk):
             tg.reset_client()
         except Exception:
             pass
-        self._check_tg()
-        messagebox.showinfo("", "Telegram настройки сохранены")
+        self._refresh_tg_auth_status()
+        if not silent:
+            messagebox.showinfo("", "Telegram настройки сохранены")
+        return True
 
     def _tg_send_code(self) -> None:
         phone = self.e_phone.get().strip() or config.TELEGRAM_PHONE
         if not phone:
-            messagebox.showwarning("", "Укажи телефон")
+            messagebox.showwarning("", "Укажи телефон (+7999…)")
             return
-        self._save_tg()
+        if not self._save_tg(silent=True):
+            return
+
+        self.btn_tg_send_code.configure(state="disabled", text="Отправка…")
+        self._set_tg_auth_badge("ready", "Отправляем код…", False)
 
         def _work():
             import telegram_client as tg
             ok, msg = tg.send_code(phone)
-            self.after(0, lambda: messagebox.showinfo("Код", msg) if ok else messagebox.showerror("Ошибка", msg))
+
+            def _done():
+                self.btn_tg_send_code.configure(state="normal", text="📲 Отправить код")
+                if ok:
+                    self._set_tg_auth_badge("code_sent", msg, False)
+                    messagebox.showinfo("Код отправлен", msg)
+                else:
+                    self._set_tg_auth_badge("error", msg, False)
+                    messagebox.showerror("Ошибка отправки кода", msg)
+                self._refresh_tg_auth_status()
+
+            self.after(0, _done)
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -765,26 +827,31 @@ class WindyGUI(ctk.CTk):
             messagebox.showwarning("", "Телефон и код обязательны")
             return
 
+        self.btn_tg_sign_in.configure(state="disabled", text="Вход…")
+        self._set_tg_auth_badge("code_sent", "Авторизация…", False)
+
         def _work():
             import telegram_client as tg
             ok, msg = tg.sign_in(phone, code, password)
-            if ok:
-                self.after(0, lambda: self._check_tg())
-                self.after(0, lambda: self._refresh_tg_dialogs_async())
-            self.after(0, lambda: messagebox.showinfo("Telegram", msg) if ok else messagebox.showerror("Ошибка", msg))
+
+            def _done():
+                self.btn_tg_sign_in.configure(state="normal", text="🔐 Войти")
+                if ok:
+                    self.e_tg_code.delete(0, "end")
+                    self._set_tg_auth_badge("authorized", msg, True)
+                    messagebox.showinfo("Telegram", msg)
+                    self._refresh_tg_dialogs_async()
+                else:
+                    self._set_tg_auth_badge("error", msg, False)
+                    messagebox.showerror("Ошибка входа", msg)
+                self._refresh_tg_auth_status()
+
+            self.after(0, _done)
 
         threading.Thread(target=_work, daemon=True).start()
 
     def _check_tg(self) -> None:
-        def _work():
-            try:
-                import telegram_client as tg
-                ok, msg = tg.check_connection()
-                self.after(0, lambda: self.lbl_tg_status.configure(text=f"Telegram: {msg}"))
-                self.after(0, lambda: self.pill_telegram.set(ok, msg))
-            except Exception as exc:
-                self.after(0, lambda: self.lbl_tg_status.configure(text=f"Ошибка: {exc}"))
-        threading.Thread(target=_work, daemon=True).start()
+        self._refresh_tg_auth_status()
 
     # ── Animation & health ────────────────────────────────────────────────────
 
